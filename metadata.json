@@ -1,0 +1,10 @@
+{
+  "name": "ChronosForge Studio",
+  "description": "Photorealistic Smartwatch Dial Designer, Dual-Target Firmware Compiler (FitCloudPro .bin & VeryFit .iwf/.iwf.lz), and Standalone Native Android APK Builder.",
+  "requestFramePermissions": [
+    "bluetooth"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
