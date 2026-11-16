@@ -88,6 +88,54 @@ export const RESOLUTION_SPECS: ResolutionSpec[] = [
   },
 ];
 
+export const HARDWARE_EXPORT_TARGETS: ResolutionSpec[] = RESOLUTION_SPECS.filter(
+  (spec) => !spec.isFullHdMaster && spec.width <= 600 && spec.height <= 600
+);
+
+/**
+ * Clamps any designer resolution (e.g. 1080x1080 studio master) down to true
+ * smartwatch hardware dimensions (466x466, 454x454, 360x360, 368x448, 240x284)
+ * or the connected device's exact HardwareResolutionLock.
+ */
+export function clampWatchExportResolution(
+  resolution: ResolutionSpec,
+  hardwareLock?: {
+    lcdWidth: number;
+    lcdHeight: number;
+    isRound: boolean;
+  } | null
+): ResolutionSpec {
+  if (hardwareLock && hardwareLock.lcdWidth > 0 && hardwareLock.lcdHeight > 0) {
+    const width = Math.max(120, Math.round(hardwareLock.lcdWidth));
+    const height = Math.max(120, Math.round(hardwareLock.lcdHeight));
+    const shape: WatchShape = hardwareLock.isRound ? 'round' : 'squircle';
+    return {
+      id: `${width}x${height}${hardwareLock.isRound ? '' : '-square'}`,
+      label: `Hardware Locked: ${width}×${height} (${hardwareLock.isRound ? 'Round' : 'Squircle'})`,
+      width,
+      height,
+      shape,
+      cornerRadius: hardwareLock.isRound
+        ? Math.round(Math.min(width, height) / 2)
+        : Math.round(Math.min(width, height) * 0.2),
+      isFullHdMaster: false,
+    };
+  }
+
+  if (
+    !resolution.isFullHdMaster &&
+    resolution.width <= 600 &&
+    resolution.height <= 600
+  ) {
+    return { ...resolution, isFullHdMaster: false };
+  }
+
+  const fallbackId = resolution.shape === 'round' ? '466x466' : '368x448';
+  const target =
+    RESOLUTION_SPECS.find((r) => r.id === fallbackId) ?? RESOLUTION_SPECS[2];
+  return { ...target, isFullHdMaster: false };
+}
+
 interface IntactFaceSeed {
   slug: string;
   name: string;
@@ -347,6 +395,175 @@ const INTACT_FACE_SEEDS: IntactFaceSeed[] = [
   },
 ];
 
+function buildPresetDigitalConfig(
+  seed: IntactFaceSeed
+): {
+  digitalLayerVisible: boolean;
+  fontStyle: 'metallic' | 'oledGlow' | 'tacticalStencil';
+  hoursColor: string;
+  minutesColor: string;
+  secondsColor: string;
+  dateColor: string;
+  widgets: WatchFaceConfig['digital']['widgets'];
+} {
+  if (seed.slug === 'obsidian-infinity-8') {
+    return {
+      digitalLayerVisible: true,
+      fontStyle: 'metallic',
+      hoursColor: '#f8fafc',
+      minutesColor: '#cbd5e1',
+      secondsColor: '#94a3b8',
+      dateColor: '#e2e8f0',
+      widgets: [
+        {
+          id: 'w-time',
+          enabled: true,
+          type: 'timeDigital',
+          label: 'Live Hour Number',
+          relX: 0,
+          relY: 0,
+          fontSet: 'time',
+          scale: 2.55,
+          align: 'center',
+          layout: 'hourOnly',
+        },
+      ],
+    };
+  }
+
+  if (seed.slug === 'titanium-xbridge-hybrid') {
+    return {
+      digitalLayerVisible: true,
+      fontStyle: 'oledGlow',
+      hoursColor: '#f8fafc',
+      minutesColor: '#f8fafc',
+      secondsColor: '#c9b17e',
+      dateColor: '#e2e8f0',
+      widgets: [
+        {
+          id: 'w-time',
+          enabled: true,
+          type: 'timeDigital',
+          label: 'Digital Time',
+          relX: 0,
+          relY: -0.222,
+          fontSet: 'time',
+          scale: 0.72,
+          align: 'center',
+          layout: 'inline',
+        },
+      ],
+    };
+  }
+
+  if (seed.slug === 'concentric-blue-date') {
+    return {
+      digitalLayerVisible: true,
+      fontStyle: 'oledGlow',
+      hoursColor: '#ffffff',
+      minutesColor: '#ffffff',
+      secondsColor: '#38bdf8',
+      dateColor: '#f8fafc',
+      widgets: [
+        {
+          id: 'w-time',
+          enabled: true,
+          type: 'timeDigital',
+          label: 'Digital Time',
+          relX: 0,
+          relY: -0.292,
+          fontSet: 'metrics',
+          scale: 0.86,
+          align: 'center',
+          layout: 'stacked',
+        },
+        {
+          id: 'w-day',
+          enabled: true,
+          type: 'day',
+          label: 'Weekday',
+          relX: 0,
+          relY: -0.045,
+          fontSet: 'small',
+          scale: 0.92,
+          align: 'center',
+        },
+        {
+          id: 'w-date',
+          enabled: true,
+          type: 'date',
+          label: 'Date',
+          relX: 0,
+          relY: 0.045,
+          fontSet: 'metrics',
+          scale: 0.84,
+          align: 'center',
+        },
+      ],
+    };
+  }
+
+  if (seed.slug === 'gunmetal-tactical-hud') {
+    return {
+      digitalLayerVisible: true,
+      fontStyle: 'tacticalStencil',
+      hoursColor: '#dbe2ea',
+      minutesColor: '#dbe2ea',
+      secondsColor: '#f8fafc',
+      dateColor: '#93c5fd',
+      widgets: [
+        {
+          id: 'w-time',
+          enabled: true,
+          type: 'timeDigital',
+          label: 'Digital Time',
+          relX: -0.02,
+          relY: -0.095,
+          fontSet: 'time',
+          scale: 1.18,
+          align: 'center',
+          layout: 'inline',
+        },
+      ],
+    };
+  }
+
+  if (seed.slug === 'tactical-orange-hud') {
+    return {
+      digitalLayerVisible: true,
+      fontStyle: 'oledGlow',
+      hoursColor: '#f8fafc',
+      minutesColor: '#f97316',
+      secondsColor: '#f8fafc',
+      dateColor: '#f8fafc',
+      widgets: [
+        {
+          id: 'w-time',
+          enabled: true,
+          type: 'timeDigital',
+          label: 'Digital Time',
+          relX: -0.035,
+          relY: -0.02,
+          fontSet: 'time',
+          scale: 1.15,
+          align: 'center',
+          layout: 'stacked',
+        },
+      ],
+    };
+  }
+
+  return {
+    digitalLayerVisible: false,
+    fontStyle: seed.styleGroup === 'digital' ? 'oledGlow' : 'metallic',
+    hoursColor: '#f8fafc',
+    minutesColor: seed.accentColor,
+    secondsColor: seed.secondaryColor,
+    dateColor: '#e2e8f0',
+    widgets: [],
+  };
+}
+
 function createIntactPreset(
   seed: IntactFaceSeed,
   shape: WatchShape
@@ -363,11 +580,13 @@ function createIntactPreset(
   const folder = isRound ? 'round' : 'square';
   const resolution = isRound ? RESOLUTION_SPECS[0] : RESOLUTION_SPECS[1];
   const hasHands = seed.displayMode !== 'digital';
+  const digitalPreset = buildPresetDigitalConfig(seed);
+
   const layers: LayerState[] = [
     { id: 'bezel', name: 'Bezel & Outer Ring', visible: false },
     { id: 'dial', name: 'Dial Plate & Artwork', visible: true },
     { id: 'complications', name: 'Complication Arcs & Gauges', visible: false },
-    { id: 'digital', name: 'Digital Readouts & Fonts', visible: false },
+    { id: 'digital', name: 'Digital Readouts & Fonts', visible: digitalPreset.digitalLayerVisible },
     { id: 'hands', name: 'Analog Hands Overlay', visible: hasHands },
     { id: 'glassCap', name: 'Center Cap & Sapphire Glare', visible: true },
   ];
@@ -404,16 +623,16 @@ function createIntactPreset(
       arcs: [],
     },
     digital: {
-      fontStyle: seed.styleGroup === 'digital' ? 'oledGlow' : 'metallic',
+      fontStyle: digitalPreset.fontStyle,
       primaryColor: seed.accentColor,
       glowColor: seed.secondaryColor,
-      hoursColor: '#f8fafc',
-      minutesColor: seed.accentColor,
-      secondsColor: seed.secondaryColor,
-      dateColor: '#e2e8f0',
+      hoursColor: digitalPreset.hoursColor,
+      minutesColor: digitalPreset.minutesColor,
+      secondsColor: digitalPreset.secondsColor,
+      dateColor: digitalPreset.dateColor,
       metricsIconColor: seed.accentColor,
       metricsValueColor: '#f8fafc',
-      widgets: [],
+      widgets: digitalPreset.widgets,
     },
     hands: {
       enabled: hasHands,

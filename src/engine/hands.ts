@@ -20,6 +20,25 @@ function resolveHandMetalColors(config: WatchFaceConfig) {
   };
 }
 
+export function getLightDirectionalShadowOffset(config: WatchFaceConfig): {
+  offsetX: number;
+  offsetY: number;
+  blur: number;
+} {
+  const minDim = Math.min(config.resolution.width, config.resolution.height);
+  const scale = minDim / 466;
+  const lightRad = ((config.dial.lightAngleDeg ?? 315) * Math.PI) / 180;
+  const baseMag = Math.hypot(
+    config.hands.shadowOffsetX || 4,
+    config.hands.shadowOffsetY || 6
+  );
+  return {
+    offsetX: -Math.cos(lightRad) * baseMag * scale,
+    offsetY: -Math.sin(lightRad) * baseMag * scale,
+    blur: Math.max(1.5, (config.hands.shadowBlur || 7) * scale),
+  };
+}
+
 /**
  * Draws a single 3D-shaded hand pointing straight UP (12 o'clock) on a canvas
  * of size (width x height) with pivot at (width/2, height/2).
@@ -36,6 +55,7 @@ export function renderHandVertical(
   const minDim = Math.min(width, height);
   const metal = resolveHandMetalColors(config);
   const style = config.hands.style;
+  const lightOffset = getLightDirectionalShadowOffset(config);
 
   ctx.save();
   ctx.translate(cx, cy);
@@ -44,6 +64,9 @@ export function renderHandVertical(
     if (kind === 'second') {
       const tipLen = minDim * 0.41;
       const tailLen = minDim * 0.11;
+      const tailW = Math.max(2, minDim * 0.0052);
+      const rootW = Math.max(1.3, minDim * 0.003);
+      const tipW = Math.max(0.7, minDim * 0.0014);
 
       if (isShadowPass) {
         ctx.fillStyle = 'rgba(8, 8, 8, 0.58)';
@@ -55,35 +78,60 @@ export function renderHandVertical(
 
       // Counterweight tail
       ctx.beginPath();
-      ctx.moveTo(-2.4, tailLen);
-      ctx.lineTo(-1.3, 0);
-      ctx.lineTo(1.3, 0);
-      ctx.lineTo(2.4, tailLen);
+      ctx.moveTo(-tailW, tailLen);
+      ctx.lineTo(-rootW, 0);
+      ctx.lineTo(rootW, 0);
+      ctx.lineTo(tailW, tailLen);
       ctx.closePath();
       ctx.fill();
 
-      // Main needle shaft
-      ctx.beginPath();
-      ctx.moveTo(-1.4, 0);
-      ctx.lineTo(-0.6, -tipLen);
-      ctx.lineTo(0.6, -tipLen);
-      ctx.lineTo(1.4, 0);
-      ctx.closePath();
-      ctx.fill();
+      // Split-plane second needle shaft with central ridge highlight
+      if (isShadowPass) {
+        ctx.beginPath();
+        ctx.moveTo(-rootW, 0);
+        ctx.lineTo(-tipW, -tipLen);
+        ctx.lineTo(tipW, -tipLen);
+        ctx.lineTo(rootW, 0);
+        ctx.closePath();
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(-rootW, 0);
+        ctx.lineTo(-tipW, -tipLen);
+        ctx.lineTo(0, -tipLen);
+        ctx.closePath();
+        ctx.fillStyle = config.hands.secondHandColor;
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(rootW, 0);
+        ctx.lineTo(tipW, -tipLen);
+        ctx.lineTo(0, -tipLen);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(8, 12, 18, 0.25)';
+        ctx.fill();
+      }
 
       // Luminous diamond pip near tip
       const pipY = -tipLen * 0.72;
+      const pipH = Math.max(4, minDim * 0.013);
+      const pipW = Math.max(2.6, minDim * 0.0078);
       ctx.beginPath();
-      ctx.moveTo(0, pipY - 6);
-      ctx.lineTo(3.6, pipY);
-      ctx.lineTo(0, pipY + 6);
-      ctx.lineTo(-3.6, pipY);
+      ctx.moveTo(0, pipY - pipH);
+      ctx.lineTo(pipW, pipY);
+      ctx.lineTo(0, pipY + pipH);
+      ctx.lineTo(-pipW, pipY);
       ctx.closePath();
+      ctx.fillStyle = isShadowPass
+        ? 'rgba(8, 8, 8, 0.58)'
+        : config.hands.secondHandColor;
       ctx.fill();
       if (!isShadowPass) {
         ctx.fillStyle = config.hands.lumeColor;
         ctx.beginPath();
-        ctx.arc(0, pipY, 1.7, 0, Math.PI * 2);
+        ctx.arc(0, pipY, Math.max(1.5, minDim * 0.0038), 0, Math.PI * 2);
         ctx.fill();
       }
       return;
@@ -94,7 +142,7 @@ export function renderHandVertical(
     const tail = isHour ? minDim * 0.055 : minDim * 0.068;
 
     if (style === 'feuilleLeaf') {
-      // Haute Horlogerie Curved Leaf (Feuille) Hand with 3D Center Ridge
+      // Haute Horlogerie Curved Leaf (Feuille) Hand with Sharp 3D Center Ridge
       const maxBellyW = isHour ? minDim * 0.028 : minDim * 0.022;
 
       // Left leaf facet (bright specular)
@@ -132,9 +180,9 @@ export function renderHandVertical(
       if (!isShadowPass) {
         ctx.beginPath();
         ctx.moveTo(0, tail * 0.7);
-        ctx.lineTo(0, -length + 2);
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.78)';
-        ctx.lineWidth = Math.max(0.9, minDim * 0.002);
+        ctx.lineTo(0, -length + minDim * 0.004);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.82)';
+        ctx.lineWidth = Math.max(0.9, minDim * 0.0022);
         ctx.stroke();
       }
       return;
@@ -179,11 +227,12 @@ export function renderHandVertical(
     ctx.fill();
 
     if (!isShadowPass) {
+      // Crisp central specular ridge separating left bright vs right dark planes
       ctx.beginPath();
       ctx.moveTo(0, tail * 0.8);
-      ctx.lineTo(0, tipY + 2);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.65)';
-      ctx.lineWidth = Math.max(0.9, minDim * 0.002);
+      ctx.lineTo(0, tipY + minDim * 0.004);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.74)';
+      ctx.lineWidth = Math.max(0.9, minDim * 0.0022);
       ctx.stroke();
 
       const lumeStart = -length * 0.24;
@@ -209,8 +258,8 @@ export function renderHandVertical(
 
   if (includeBakedShadow) {
     ctx.save();
-    ctx.translate(config.hands.shadowOffsetX, config.hands.shadowOffsetY);
-    ctx.filter = `blur(${Math.max(1, config.hands.shadowBlur * 0.5)}px)`;
+    ctx.translate(lightOffset.offsetX, lightOffset.offsetY);
+    ctx.filter = `blur(${Math.max(1, lightOffset.blur * 0.5)}px)`;
     drawGeometry(true);
     ctx.restore();
   }
@@ -229,15 +278,29 @@ export function drawCenterPinCap(
   const minDim = Math.min(width, height);
   const capR = Math.max(6, minDim * config.glassCap.capRadiusRatio);
   const metal = getMetallicStopColors(config.glassCap.capFinish);
+  const lightRad = ((config.dial.lightAngleDeg ?? 315) * Math.PI) / 180;
+  const lx = Math.cos(lightRad);
+  const ly = Math.sin(lightRad);
 
   ctx.save();
 
   ctx.beginPath();
-  ctx.arc(cx + 1.5, cy + 2.5, capR + 1, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(8, 8, 8, 0.65)';
+  ctx.arc(
+    cx - lx * capR * 0.16,
+    cy - ly * capR * 0.16,
+    capR * 1.12,
+    0,
+    Math.PI * 2
+  );
+  ctx.fillStyle = 'rgba(8, 8, 8, 0.68)';
   ctx.fill();
 
-  const flangeGrad = ctx.createLinearGradient(cx - capR, cy - capR, cx + capR, cy + capR);
+  const flangeGrad = ctx.createLinearGradient(
+    cx + lx * capR,
+    cy + ly * capR,
+    cx - lx * capR,
+    cy - ly * capR
+  );
   flangeGrad.addColorStop(0, metal.light);
   flangeGrad.addColorStop(0.5, metal.mid);
   flangeGrad.addColorStop(1, metal.edge);
@@ -248,8 +311,8 @@ export function drawCenterPinCap(
   ctx.fill();
 
   const innerGrad = ctx.createRadialGradient(
-    cx - capR * 0.25,
-    cy - capR * 0.25,
+    cx + lx * capR * 0.25,
+    cy + ly * capR * 0.25,
     1,
     cx,
     cy,

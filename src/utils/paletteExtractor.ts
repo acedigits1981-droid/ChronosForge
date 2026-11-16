@@ -371,7 +371,7 @@ export function loadCustomImageAndPalette(
     const canvas = document.createElement('canvas');
     canvas.width = sampleSize;
     canvas.height = sampleSize;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) {
       return { img, palette: ['#f4af9d', '#38bdf8', '#f8fafc', '#1e293b', '#f97316'] };
     }
@@ -394,7 +394,7 @@ export async function autoPickWatchUiColorsFromImageUrl(
   const canvas = document.createElement('canvas');
   canvas.width = sampleSize;
   canvas.height = sampleSize;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) {
     return {
       accentColor: '#f4af9d',

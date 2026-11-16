@@ -109,6 +109,8 @@ export interface DigitalWidgetConfig {
   fontSet: 'time' | 'metrics' | 'small';
   scale: number;
   align: 'left' | 'center' | 'right';
+  /** 'inline' = HH:MM, 'stacked' = HH over MM (vertical), 'hourOnly' = single hour number (1, 10, 19) */
+  layout?: 'inline' | 'stacked' | 'hourOnly';
 }
 
 export type PresetCategory =
@@ -139,6 +141,16 @@ export interface BackdropPillConfig {
   enabled: boolean;
   color: string;
   opacity: number; // 0.1 .. 0.95
+}
+
+export interface CustomFontAsset {
+  id: string;
+  name: string;
+  fileName: string;
+  format: 'ttf' | 'otf';
+  familyName: string;
+  dataUrl: string;
+  byteSize: number;
 }
 
 export interface WatchFaceConfig {
@@ -196,6 +208,8 @@ export interface WatchFaceConfig {
 
   digital: {
     fontStyle: 'metallic' | 'oledGlow' | 'tacticalStencil';
+    customFonts?: CustomFontAsset[];
+    activeCustomFontId?: string | null;
     primaryColor: string;
     glowColor: string;
     hoursColorMode?: 'solid' | 'gradient';

@@ -10,6 +10,7 @@ import {
   Eye,
   Gem,
   Globe,
+  Lock,
   Moon,
   Palette,
   Pipette,
@@ -25,7 +26,12 @@ import {
   drawDialPlate,
   isUsingIntactArtwork,
 } from '../engine/materials';
-import { renderLiveWatchFrame } from '../engine/renderer';
+import {
+  renderLiveWatchFrame,
+  renderSupersampledWatchFrame,
+  scaleConfigToMaxDim,
+  SUPERSAMPLE_TARGET_DIM,
+} from '../engine/renderer';
 import {
   classifyEasyPreset,
   EASY_COLOR_PALETTE,
@@ -52,6 +58,7 @@ import {
   WatchFaceConfig,
 } from '../types/watchface';
 import { hexToHsl, hslToHex } from '../utils/colorUtils';
+import { ensureConfigFontsRegistered } from '../utils/customFontManager';
 import {
   autoPickWatchUiColorsFromImageUrl,
   ExtractedWatchUiColors,
@@ -60,10 +67,21 @@ import {
 } from '../utils/paletteExtractor';
 import { getSystemClockState } from '../utils/systemClock';
 import {
+  clientDeltaToWatchRelDelta,
+  DigitalClockLayout,
+  getPrimaryTimeWidget,
+  updatePrimaryTimeWidget,
+} from '../utils/digitalPlacement';
+import {
   CustomImageUploadControls,
   processUploadedDialImageFile,
 } from './CustomImageUploadControls';
 import { HslColorPicker } from './HslColorPicker';
+
+import {
+  formatHardwareLockBadgeText,
+  HardwareResolutionLock,
+} from '../types/nativeBridge';
 
 export type EasyStepId = 1 | 2 | 3 | 4 | 5;
 type ColorZone = 'face' | 'border' | 'hands';
@@ -85,6 +103,8 @@ interface EasyStudioProps {
   isExporting: boolean;
   lastExportBanner: string | null;
   onDismissBanner: () => void;
+  pauseRender?: boolean;
+  hardwareLock?: HardwareResolutionLock | null;
 }
 
 const THUMB_DATA_URL_CACHE = new Map<string, string>();
@@ -264,6 +284,8 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   isExporting,
   lastExportBanner,
   onDismissBanner,
+  pauseRender = false,
+  hardwareLock = null,
 }) => {
   const t = getTranslations(language);
   const dir = getLanguageDir(language);
@@ -274,12 +296,14 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   );
   const [colorZone, setColorZone] = useState<ColorZone>('face');
   const [showCustomHsl, setShowCustomHsl] = useState(false);
+  const [activePhotoColorId, setActivePhotoColorId] = useState<string | null>(null);
 
-  // Watch Canvas Refs & Caches (mirrors WatchViewport performance optimizations)
+  // Watch Canvas Refs & Caches (2048px internal supersampling + pooled scratch buffer)
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cachedDialPlateRef = useRef<HTMLCanvasElement | null>(null);
   const cachedStaticDialRef = useRef<HTMLCanvasElement | null>(null);
+  const liveHighResCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const glyphCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const simRef = useRef<SimulationState>(sim);
   simRef.current = sim;
@@ -287,7 +311,16 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   configRef.current = config;
   const [dialPlateRevision, setDialPlateRevision] = useState(0);
   const [imageLoadRev, setImageLoadRev] = useState(0);
+  const [fontLoadRev, setFontLoadRev] = useState(0);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isDraggingClock, setIsDraggingClock] = useState(false);
+  const dragClockRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origRelX: number;
+    origRelY: number;
+  } | null>(null);
   const [autoPickedHex, setAutoPickedHex] = useState<string | null>(null);
   const [isPickingColor, setIsPickingColor] = useState(false);
   const [clockSnapshot, setClockSnapshot] = useState(() =>
@@ -296,11 +329,12 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
 
   useEffect(() => {
     setClockSnapshot(getSystemClockState(new Date()));
+    if (pauseRender) return;
     const interval = window.setInterval(() => {
       setClockSnapshot(getSystemClockState(new Date()));
     }, 1000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [pauseRender]);
 
   useEffect(() => {
     const customImg = config.dial.customImage;
@@ -320,6 +354,22 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
     config.dial.customImage?.dataUrl,
     config.dial.intactArtworkUrl,
   ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!config.digital.customFonts?.length) return;
+    ensureConfigFontsRegistered(config)
+      .then((didLoad) => {
+        if (!cancelled && didLoad) {
+          glyphCacheRef.current.clear();
+          setFontLoadRev((r) => r + 1);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [config.digital.customFonts, config.digital.activeCustomFontId]);
 
   const dialVisible = config.layers.find((l) => l.id === 'dial')?.visible ?? true;
   const bezelVisible = config.layers.find((l) => l.id === 'bezel')?.visible ?? true;
@@ -341,72 +391,109 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   const previewConfigRef = useRef<WatchFaceConfig>(previewConfig);
   previewConfigRef.current = previewConfig;
 
+  const highResConfig = useMemo<WatchFaceConfig>(
+    () => scaleConfigToMaxDim(previewConfig, SUPERSAMPLE_TARGET_DIM),
+    [previewConfig]
+  );
+  const highResConfigRef = useRef<WatchFaceConfig>(highResConfig);
+  highResConfigRef.current = highResConfig;
+
   useEffect(() => {
     const rafId = window.requestAnimationFrame(() => {
-      const pCfg = previewConfigRef.current;
-      const { width: pw, height: ph } = pCfg.resolution;
-      const plateCanvas = document.createElement('canvas');
-      plateCanvas.width = pw;
-      plateCanvas.height = ph;
+      const hCfg = highResConfigRef.current;
+      const { width: hw, height: hh } = hCfg.resolution;
+      const plateCanvas =
+        cachedDialPlateRef.current ?? document.createElement('canvas');
+      if (plateCanvas.width !== hw) plateCanvas.width = hw;
+      if (plateCanvas.height !== hh) plateCanvas.height = hh;
       const pctx = plateCanvas.getContext('2d', { willReadFrequently: true })!;
+      pctx.clearRect(0, 0, hw, hh);
       if (dialVisible) {
-        drawDialPlate(pctx, pCfg);
+        drawDialPlate(pctx, hCfg);
       } else {
         pctx.fillStyle = '#090b0f';
-        pctx.fillRect(0, 0, pw, ph);
+        pctx.fillRect(0, 0, hw, hh);
       }
       cachedDialPlateRef.current = plateCanvas;
       setDialPlateRevision((r) => r + 1);
     });
     return () => window.cancelAnimationFrame(rafId);
   }, [
-    previewConfig.resolution,
-    previewConfig.dial.intactArtworkUrl,
-    previewConfig.dial.material,
-    previewConfig.dial.baseColor,
-    previewConfig.dial.secondaryColor,
-    previewConfig.dial.lightAngleDeg,
-    previewConfig.dial.iridescenceIntensity,
-    previewConfig.dial.overlayTintColor,
-    previewConfig.dial.overlayTintOpacity,
-    previewConfig.dial.customImage,
+    highResConfig.resolution,
+    highResConfig.dial.intactArtworkUrl,
+    highResConfig.dial.material,
+    highResConfig.dial.baseColor,
+    highResConfig.dial.secondaryColor,
+    highResConfig.dial.lightAngleDeg,
+    highResConfig.dial.iridescenceIntensity,
+    highResConfig.dial.overlayTintColor,
+    highResConfig.dial.overlayTintOpacity,
+    highResConfig.dial.customImage,
     dialVisible,
     imageLoadRev,
   ]);
 
   useEffect(() => {
     if (!cachedDialPlateRef.current) return;
-    const pCfg = previewConfigRef.current;
-    const { width: pw, height: ph } = pCfg.resolution;
-    const compositeCanvas = document.createElement('canvas');
-    compositeCanvas.width = pw;
-    compositeCanvas.height = ph;
+    const hCfg = highResConfigRef.current;
+    const { width: hw, height: hh } = hCfg.resolution;
+    const compositeCanvas =
+      cachedStaticDialRef.current ?? document.createElement('canvas');
+    if (compositeCanvas.width !== hw) compositeCanvas.width = hw;
+    if (compositeCanvas.height !== hh) compositeCanvas.height = hh;
     const cctx = compositeCanvas.getContext('2d', { willReadFrequently: true })!;
+    cctx.clearRect(0, 0, hw, hh);
 
     if (
-      cachedDialPlateRef.current.width === pw &&
-      cachedDialPlateRef.current.height === ph
+      cachedDialPlateRef.current.width === hw &&
+      cachedDialPlateRef.current.height === hh
     ) {
       cctx.drawImage(cachedDialPlateRef.current, 0, 0);
     }
 
-    const intactMode = isUsingIntactArtwork(pCfg);
+    const intactMode = isUsingIntactArtwork(hCfg);
     if (bezelVisible && !intactMode) {
-      drawBezelAndOuterRing(cctx, pCfg);
+      drawBezelAndOuterRing(cctx, hCfg);
     }
     if (dialVisible && !intactMode) {
-      drawDialMotifLayer(cctx, pCfg);
+      drawDialMotifLayer(cctx, hCfg);
     }
     cachedStaticDialRef.current = compositeCanvas;
+
+    // Immediate synchronous draw so initial/paused frames never wait on RAF
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (ctx) {
+        if (!liveHighResCanvasRef.current) {
+          liveHighResCanvasRef.current = document.createElement('canvas');
+        }
+        const sysClock = getSystemClockState(new Date());
+        renderSupersampledWatchFrame(
+          ctx,
+          previewConfigRef.current,
+          {
+            ...simRef.current,
+            realTime: true,
+            timeSeconds: sysClock.timeSeconds,
+          },
+          compositeCanvas,
+          liveHighResCanvasRef.current,
+          glyphCacheRef.current
+        );
+      }
+    }
   }, [
     dialPlateRevision,
-    previewConfig.resolution,
-    previewConfig.dial.intactArtworkUrl,
-    previewConfig.dial.customImage?.enabled,
-    previewConfig.bezel,
-    previewConfig.dial.motif,
-    previewConfig.displayMode,
-    previewConfig.hands.enabled,
+    highResConfig.resolution,
+    highResConfig.dial.intactArtworkUrl,
+    highResConfig.dial.customImage?.enabled,
+    highResConfig.bezel,
+    highResConfig.dial.motif,
+    highResConfig.dial.lightAngleDeg,
+    highResConfig.dial.recessedAoDepth,
+    highResConfig.displayMode,
+    highResConfig.hands.enabled,
     bezelVisible,
     dialVisible,
   ]);
@@ -414,28 +501,31 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   useEffect(() => {
     glyphCacheRef.current.clear();
   }, [
-    previewConfig.resolution,
-    previewConfig.digital.fontStyle,
-    previewConfig.digital.primaryColor,
-    previewConfig.digital.glowColor,
-    previewConfig.digital.hoursColorMode,
-    previewConfig.digital.hoursColor,
-    previewConfig.digital.hoursGradientTop,
-    previewConfig.digital.hoursGradientBottom,
-    previewConfig.digital.minutesColor,
-    previewConfig.digital.secondsColor,
-    previewConfig.digital.ampmColor,
-    previewConfig.digital.dateColor,
-    previewConfig.digital.metricsValueColor,
-    previewConfig.digital.metricsIconColor,
+    highResConfig.resolution,
+    highResConfig.digital.fontStyle,
+    highResConfig.digital.activeCustomFontId,
+    highResConfig.digital.customFonts,
+    highResConfig.digital.primaryColor,
+    highResConfig.digital.glowColor,
+    highResConfig.digital.hoursColorMode,
+    highResConfig.digital.hoursColor,
+    highResConfig.digital.hoursGradientTop,
+    highResConfig.digital.hoursGradientBottom,
+    highResConfig.digital.minutesColor,
+    highResConfig.digital.secondsColor,
+    highResConfig.digital.ampmColor,
+    highResConfig.digital.dateColor,
+    highResConfig.digital.metricsValueColor,
+    highResConfig.digital.metricsIconColor,
+    fontLoadRev,
   ]);
 
   useEffect(() => {
     let rafId = 0;
     let cancelled = false;
     let lastDrawMs = 0;
+    let lastRenderCostMs = 0;
     let lastSecDrawn = -1;
-    let lastSimTimeDrawn = -1;
 
     const renderLoop = (nowMs: number) => {
       if (cancelled) return;
@@ -445,37 +535,41 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
       const canvas = canvasRef.current;
 
       const sysClock = getSystemClockState(new Date());
-      const effectiveTimeSec = currentSim.realTime
-        ? sysClock.timeSeconds
-        : currentSim.timeSeconds;
+      const sweepIntervalMs = Math.max(50, Math.min(350, lastRenderCostMs * 3));
       const shouldDraw =
         lastDrawMs === 0 ||
-        (!currentSim.realTime && effectiveTimeSec !== lastSimTimeDrawn) ||
-        (currentSim.realTime &&
-          (currentSim.sweep60fps
-            ? nowMs - lastDrawMs >= 66
-            : sysClock.seconds !== lastSecDrawn));
+        (currentSim.sweep60fps
+          ? nowMs - lastDrawMs >= sweepIntervalMs
+          : sysClock.seconds !== lastSecDrawn);
 
       if (shouldDraw && staticBg && canvas) {
+        const t0 = performance.now();
         lastDrawMs = nowMs;
         lastSecDrawn = sysClock.seconds;
-        lastSimTimeDrawn = effectiveTimeSec;
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (ctx) {
-          renderLiveWatchFrame(
+          if (!liveHighResCanvasRef.current) {
+            liveHighResCanvasRef.current = document.createElement('canvas');
+          }
+          renderSupersampledWatchFrame(
             ctx,
             currentConfig,
             {
               ...currentSim,
-              timeSeconds: effectiveTimeSec,
+              realTime: true,
+              timeSeconds: sysClock.timeSeconds,
             },
             staticBg,
+            liveHighResCanvasRef.current,
             glyphCacheRef.current
           );
         }
+        lastRenderCostMs = performance.now() - t0;
       }
 
-      rafId = window.requestAnimationFrame(renderLoop);
+      if (!cancelled && !pauseRender) {
+        rafId = window.requestAnimationFrame(renderLoop);
+      }
     };
 
     rafId = window.requestAnimationFrame(renderLoop);
@@ -483,7 +577,7 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
       cancelled = true;
       window.cancelAnimationFrame(rafId);
     };
-  }, [dialPlateRevision, previewConfig, sim]);
+  }, [dialPlateRevision, previewConfig, sim, pauseRender, fontLoadRev]);
 
   const handleEasyFileInput = async (
     e: React.ChangeEvent<HTMLInputElement>
@@ -644,6 +738,7 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   ];
 
   const handleToggleRoundSquare = (targetShape: 'round' | 'squircle') => {
+    if (hardwareLock) return;
     setPresetFilter(targetShape === 'round' ? 'round-all' : 'square-all');
     if (targetShape === 'round') {
       onSelectResolution(isFullHd ? RESOLUTION_SPECS[0] : RESOLUTION_SPECS[2]);
@@ -653,6 +748,7 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   };
 
   const handleToggleHd = (enableHd: boolean) => {
+    if (hardwareLock) return;
     onChangeSim({ ...sim, fullHdMasterMode: enableHd });
     if (enableHd) {
       onSelectResolution(
@@ -690,11 +786,54 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
   };
 
   const displayMode = getDisplayMode(config);
+  const primaryTimeWidget = getPrimaryTimeWidget(config);
+  const isDigitalLayerActive =
+    (config.layers.find((l) => l.id === 'digital')?.visible ?? true) &&
+    Boolean(primaryTimeWidget?.enabled);
+
+  const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isDigitalLayerActive || !primaryTimeWidget || !canvasRef.current) return;
+    canvasRef.current.setPointerCapture?.(e.pointerId);
+    dragClockRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origRelX: primaryTimeWidget.relX,
+      origRelY: primaryTimeWidget.relY,
+    };
+    setIsDraggingClock(true);
+  };
+
+  const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = dragClockRef.current;
+    if (!drag || !canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const { dRelX, dRelY } = clientDeltaToWatchRelDelta(
+      e.clientX - drag.startX,
+      e.clientY - drag.startY,
+      rect.width,
+      rect.height
+    );
+    onChangeConfig(
+      updatePrimaryTimeWidget(configRef.current, {
+        relX: drag.origRelX + dRelX,
+        relY: drag.origRelY + dRelY,
+      })
+    );
+  };
+
+  const handleCanvasPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (dragClockRef.current?.pointerId === e.pointerId) {
+      canvasRef.current?.releasePointerCapture?.(e.pointerId);
+      dragClockRef.current = null;
+      setIsDraggingClock(false);
+    }
+  };
 
   return (
     <div
       dir={dir}
-      className="min-h-screen flex flex-col bg-[#090b10] text-slate-100"
+      className="min-h-screen flex flex-col bg-[#090b10] text-slate-100 overflow-x-hidden"
     >
       {/* Clean 3-Zone Top Bar */}
       <header className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-5 py-3 border-b border-slate-800/90 bg-[#0d111a]">
@@ -751,14 +890,37 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
           </label>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setStep(5)}
-          className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 sm:px-5 py-2 sm:py-2.5 text-xs sm:text-sm font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer min-h-[40px] sm:min-h-[44px] order-2 lg:order-3"
-        >
-          <Download className="w-4 h-4" />
-          {t.saveNowBtn}
-        </button>
+        <div className="flex flex-wrap items-center gap-2 order-2 lg:order-3 w-full sm:w-auto justify-start sm:justify-end min-w-0">
+          {hardwareLock && (
+            <span
+              data-testid="easy-hardware-lock-badge"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-950/75 border border-emerald-500/60 px-3 py-1.5 text-xs font-semibold text-emerald-200 whitespace-nowrap"
+            >
+              <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              {formatHardwareLockBadgeText(
+                hardwareLock.lcdWidth,
+                hardwareLock.lcdHeight,
+                hardwareLock.isRound
+              )}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={onOpenWebBle}
+            className="inline-flex items-center gap-2 rounded-xl bg-sky-600 hover:bg-sky-500 px-3.5 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer min-h-[40px] sm:min-h-[44px]"
+          >
+            <Bluetooth className="w-4 h-4" />
+            {t.sendBluetooth}
+          </button>
+          <button
+            type="button"
+            onClick={() => setStep(5)}
+            className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-3.5 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer min-h-[40px] sm:min-h-[44px]"
+          >
+            <Download className="w-4 h-4" />
+            {t.saveNowBtn}
+          </button>
+        </div>
       </header>
 
       {lastExportBanner && (
@@ -835,7 +997,22 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
                     data-testid="easy-watch-canvas"
                     width={previewW}
                     height={previewH}
-                    className="block max-w-[300px] sm:max-w-[340px] max-h-[370px] w-auto h-auto select-none"
+                    onPointerDown={handleCanvasPointerDown}
+                    onPointerMove={handleCanvasPointerMove}
+                    onPointerUp={handleCanvasPointerUp}
+                    onPointerCancel={handleCanvasPointerUp}
+                    title={
+                      isDigitalLayerActive
+                        ? 'Drag anywhere on watch to move digital clock position'
+                        : undefined
+                    }
+                    className={`block max-w-[300px] sm:max-w-[340px] max-h-[370px] w-auto h-auto select-none ${
+                      isDigitalLayerActive
+                        ? isDraggingClock
+                          ? 'cursor-grabbing touch-none'
+                          : 'cursor-grab touch-none'
+                        : ''
+                    }`}
                   />
                   {isDragOver && (
                     <div className="absolute inset-0 bg-slate-950/75 flex items-center justify-center text-xs font-semibold text-orange-300 pointer-events-none">
@@ -867,12 +1044,12 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
             </div>
           </div>
 
-          {/* Unboxed Device Clock Status + Interactive Time / Timer Tester */}
-          <div className="w-full pt-1 space-y-2.5">
+          {/* 100% Automatic Phone/Device Clock Sync (Zero Manual Time Controls) */}
+          <div className="w-full pt-1 space-y-2">
             <div className="flex flex-wrap items-center justify-center gap-2 text-xs sm:text-sm text-slate-300">
               <Clock className="w-4 h-4 text-emerald-400 shrink-0" />
               <span className="font-medium text-emerald-300">
-                {sim.realTime ? t.autoSyncedClock : t.pausedClockBtn}
+                {t.autoSyncedClock}
               </span>
               <span className="text-slate-500">·</span>
               <span
@@ -884,56 +1061,26 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
               </span>
               <span className="text-slate-500">·</span>
               <span dir="ltr" className="font-mono text-slate-400 inline-block">
-                {clockSnapshot.timezone}
+                {clockSnapshot.timezone} ({clockSnapshot.is24Hour ? '24h' : '12h'})
               </span>
             </div>
 
-            <div className="flex flex-wrap items-center justify-center gap-1.5">
-              <span className="text-[11px] font-medium text-slate-400 mr-1">
-                {t.previewControlsTitle}:
-              </span>
-              <button
-                type="button"
-                data-testid="easy-time-live-btn"
-                onClick={() => onChangeSim({ ...sim, realTime: true })}
-                className={`px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
-                  sim.realTime
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-[#141a26] border border-slate-700 text-slate-300 hover:text-white'
-                }`}
-              >
-                {t.liveClockBtn}
-              </button>
-              {(
-                [
-                  [9 * 3600 + 40 * 60, t.morningBtn],
-                  [12 * 3600, t.noonBtn],
-                  [22 * 3600 + 10 * 60 + 25, t.eveningBtn],
-                ] as Array<[number, string]>
-              ).map(([secVal, lbl]) => {
-                const isActive =
-                  !sim.realTime && Math.abs(sim.timeSeconds - secVal) < 30;
-                return (
-                  <button
-                    key={lbl}
-                    type="button"
-                    onClick={() =>
-                      onChangeSim({
-                        ...sim,
-                        realTime: false,
-                        timeSeconds: secVal,
-                      })
-                    }
-                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
-                      isActive
-                        ? 'bg-orange-600 text-white'
-                        : 'bg-[#141a26] border border-slate-700 text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    {lbl}
-                  </button>
-                );
-              })}
+            <div className="flex items-center justify-center">
+              <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={sim.sweep60fps}
+                  onChange={(e) =>
+                    onChangeSim({
+                      ...sim,
+                      realTime: true,
+                      sweep60fps: e.target.checked,
+                    })
+                  }
+                  className="accent-orange-500"
+                />
+                Sweep Second Hand (60fps vs 1Hz Tick)
+              </label>
             </div>
           </div>
         </section>
@@ -982,15 +1129,30 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
             {/* STEP 1: WATCH SHAPE */}
             {step === 1 && (
               <div className="space-y-5">
-                <h2 className="text-xl font-bold text-white font-display">
-                  1. {t.shapeQuestion}
-                </h2>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-xl font-bold text-white font-display">
+                    1. {t.shapeQuestion}
+                  </h2>
+                  {hardwareLock && (
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-950/75 border border-emerald-500/60 px-2.5 py-1 text-xs font-semibold text-emerald-200">
+                      <Lock className="w-3.5 h-3.5 text-emerald-400" />
+                      {formatHardwareLockBadgeText(
+                        hardwareLock.lcdWidth,
+                        hardwareLock.lcdHeight,
+                        hardwareLock.isRound
+                      )}
+                    </span>
+                  )}
+                </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <button
                     type="button"
+                    disabled={Boolean(hardwareLock)}
                     onClick={() => handleToggleRoundSquare('round')}
-                    className={`relative flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-colors cursor-pointer min-h-[168px] ${
+                    className={`relative flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-colors min-h-[168px] ${
+                      hardwareLock ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+                    } ${
                       shape === 'round'
                         ? 'bg-orange-600/15 border-orange-500 text-white'
                         : 'bg-[#131926] border-slate-700/80 text-slate-200 hover:border-slate-500'
@@ -1014,8 +1176,11 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
 
                   <button
                     type="button"
+                    disabled={Boolean(hardwareLock)}
                     onClick={() => handleToggleRoundSquare('squircle')}
-                    className={`relative flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-colors cursor-pointer min-h-[168px] ${
+                    className={`relative flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-colors min-h-[168px] ${
+                      hardwareLock ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+                    } ${
                       shape === 'squircle'
                         ? 'bg-orange-600/15 border-orange-500 text-white'
                         : 'bg-[#131926] border-slate-700/80 text-slate-200 hover:border-slate-500'
@@ -1041,8 +1206,11 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
                 {/* Big Friendly HD Quality Switch */}
                 <button
                   type="button"
+                  disabled={Boolean(hardwareLock)}
                   onClick={() => handleToggleHd(!isFullHd)}
-                  className={`w-full flex items-center justify-between gap-4 p-4 rounded-2xl border-2 text-left transition-colors cursor-pointer min-h-[72px] ${
+                  className={`w-full flex items-center justify-between gap-4 p-4 rounded-2xl border-2 text-left transition-colors min-h-[72px] ${
+                    hardwareLock ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+                  } ${
                     isFullHd
                       ? 'bg-pink-600/15 border-pink-500/80 text-white'
                       : 'bg-[#131926] border-slate-700/80 text-slate-200'
@@ -1195,7 +1363,10 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
                 <CustomImageUploadControls
                   config={config}
                   onChangeConfig={onChangeConfig}
-                  compact
+                  activeColorId={activePhotoColorId}
+                  onToggleColorPicker={(id) =>
+                    setActivePhotoColorId((prev) => (prev === id ? null : id))
+                  }
                 />
 
                 {/* 1-Click Auto-Pick Color From Watch Image */}
@@ -1419,6 +1590,148 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
                   </div>
                 </div>
 
+                {/* Digital Clock Position, Size & Style (Drag on Watch or Fine-Tune) */}
+                {isDigitalLayerActive && primaryTimeWidget && (
+                  <div className="rounded-2xl bg-[#131926] border border-sky-500/40 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-sm font-bold text-white">
+                          Digital Clock Position &amp; Style
+                        </div>
+                        <p className="text-xs text-slate-400">
+                          Drag directly on the watch preview or move sliders to place the clock in any empty spot.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onChangeConfig(
+                            updatePrimaryTimeWidget(config, { relX: 0, relY: 0 })
+                          )
+                        }
+                        className="px-3 py-1.5 rounded-lg bg-[#0d111a] border border-slate-700 text-xs font-semibold text-slate-200 hover:text-white cursor-pointer"
+                      >
+                        Center (0, 0)
+                      </button>
+                    </div>
+
+                    <div
+                      role="group"
+                      aria-label="Digital Clock Format"
+                      className="grid grid-cols-3 gap-2"
+                    >
+                      {(
+                        [
+                          ['inline', 'HH:MM'],
+                          ['stacked', 'Stacked'],
+                          ['hourOnly', 'Hour (1, 10, 19)'],
+                        ] as Array<[DigitalClockLayout, string]>
+                      ).map(([layoutKey, label]) => {
+                        const active =
+                          (primaryTimeWidget.layout ?? 'inline') === layoutKey;
+                        return (
+                          <button
+                            key={layoutKey}
+                            type="button"
+                            aria-pressed={active}
+                            onClick={() =>
+                              onChangeConfig(
+                                updatePrimaryTimeWidget(config, {
+                                  layout: layoutKey,
+                                })
+                              )
+                            }
+                            className={`py-2 px-2.5 rounded-xl border text-xs font-semibold cursor-pointer ${
+                              active
+                                ? 'bg-sky-600/25 border-sky-500 text-white'
+                                : 'bg-[#0d111a] border-slate-800 text-slate-300 hover:text-white'
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                      <label className="space-y-1">
+                        <div className="flex justify-between text-slate-300">
+                          <span>Left / Right (X)</span>
+                          <span dir="ltr" className="font-mono text-sky-300">
+                            {Math.round(primaryTimeWidget.relX * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="Digital Clock X Position"
+                          min={-0.42}
+                          max={0.42}
+                          step={0.01}
+                          value={primaryTimeWidget.relX}
+                          onChange={(e) =>
+                            onChangeConfig(
+                              updatePrimaryTimeWidget(config, {
+                                relX: Number(e.target.value),
+                              })
+                            )
+                          }
+                          className="w-full accent-sky-500"
+                        />
+                      </label>
+
+                      <label className="space-y-1">
+                        <div className="flex justify-between text-slate-300">
+                          <span>Up / Down (Y)</span>
+                          <span dir="ltr" className="font-mono text-sky-300">
+                            {Math.round(primaryTimeWidget.relY * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="Digital Clock Y Position"
+                          min={-0.42}
+                          max={0.42}
+                          step={0.01}
+                          value={primaryTimeWidget.relY}
+                          onChange={(e) =>
+                            onChangeConfig(
+                              updatePrimaryTimeWidget(config, {
+                                relY: Number(e.target.value),
+                              })
+                            )
+                          }
+                          className="w-full accent-sky-500"
+                        />
+                      </label>
+
+                      <label className="space-y-1">
+                        <div className="flex justify-between text-slate-300">
+                          <span>Clock Size</span>
+                          <span dir="ltr" className="font-mono text-sky-300">
+                            {primaryTimeWidget.scale.toFixed(2)}×
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="Digital Clock Size"
+                          min={0.45}
+                          max={3.2}
+                          step={0.05}
+                          value={primaryTimeWidget.scale}
+                          onChange={(e) =>
+                            onChangeConfig(
+                              updatePrimaryTimeWidget(config, {
+                                scale: Number(e.target.value),
+                              })
+                            )
+                          }
+                          className="w-full accent-sky-500"
+                        />
+                      </label>
+                    </div>
+                  </div>
+                )}
+
                 {/* Hand Color Auto-Pick + Show Hands Toggle */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <button
@@ -1580,6 +1893,36 @@ export const EasyStudio: React.FC<EasyStudioProps> = ({
                     </div>
                   </button>
                 </div>
+
+                {/* Studio Light Angle (3D Specular & Cast Shadows) */}
+                <label className="block rounded-2xl bg-[#131926] border border-slate-800 p-4 space-y-2">
+                  <div className="flex items-center justify-between text-sm font-semibold text-slate-200">
+                    <span className="flex items-center gap-2">
+                      <Sun className="w-4 h-4 text-amber-400" />
+                      Studio Light Angle
+                    </span>
+                    <span dir="ltr" className="font-mono text-sky-300">
+                      {config.dial.lightAngleDeg}°
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    aria-label="Studio Light Angle"
+                    min={0}
+                    max={360}
+                    value={config.dial.lightAngleDeg}
+                    onChange={(e) =>
+                      onChangeConfig({
+                        ...config,
+                        dial: {
+                          ...config.dial,
+                          lightAngleDeg: Number(e.target.value),
+                        },
+                      })
+                    }
+                    className="w-full accent-sky-500 cursor-pointer"
+                  />
+                </label>
               </div>
             )}
 

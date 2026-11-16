@@ -26,8 +26,20 @@ export async function processUploadedDialImageFile(
   };
   onChangeConfig({
     ...currentConfig,
+    layers: currentConfig.layers.map((l) =>
+      l.id === 'bezel' ? { ...l, visible: true } : l
+    ),
+    bezel: {
+      ...currentConfig.bezel,
+      style:
+        currentConfig.bezel.style === 'minimal'
+          ? 'minuteTrack'
+          : currentConfig.bezel.style,
+      lumePips: true,
+    },
     dial: {
       ...currentConfig.dial,
+      recessedAoDepth: Math.max(currentConfig.dial.recessedAoDepth ?? 0.4, 0.58),
       customImage: nextCustom,
     },
   });

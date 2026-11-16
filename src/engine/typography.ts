@@ -1,4 +1,5 @@
 import { WatchFaceConfig } from '../types/watchface';
+import { resolveGlyphFontFamily } from '../utils/customFontManager';
 
 export const GLYPH_CHARSET = [
   '0',
@@ -162,16 +163,13 @@ export function renderGlyphCanvas(
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
 
   const role = options?.role ?? 'default';
   const resolved = resolveGlyphColors(config, role);
 
   ctx.save();
-  const family =
-    config.digital.fontStyle === 'tacticalStencil'
-      ? '"JetBrains Mono", monospace'
-      : '"Outfit", "Plus Jakarta Sans", sans-serif';
+  const family = resolveGlyphFontFamily(config);
   ctx.font = `700 ${fontSize}px ${family}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';

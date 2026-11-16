@@ -9,7 +9,11 @@ import {
   WatchFaceConfig,
 } from '../types/watchface';
 import { hexToRgb } from './materials';
-import { drawCenterPinCap, renderHandVertical } from './hands';
+import {
+  drawCenterPinCap,
+  getLightDirectionalShadowOffset,
+  renderHandVertical,
+} from './hands';
 import { drawDialMotifLayer, drawLiveDialAccents } from './dialMotifs';
 import {
   clipWatchBoundary,
@@ -29,8 +33,35 @@ import {
   GlyphRole,
   renderGlyphCanvas,
 } from './typography';
+import {
+  adaptWatchFaceToResolution,
+  clampWatchExportResolution,
+} from '../presets/watchPresets';
 import { getSystemClockState, SystemClockState } from '../utils/systemClock';
+import { formatLiveHourNumber } from '../utils/digitalPlacement';
+import { resolveActiveCustomFont } from '../utils/customFontManager';
 import { roundedRectPath } from './textureEngine';
+
+export const SUPERSAMPLE_TARGET_DIM = 2048;
+
+export function scaleConfigToMaxDim(
+  config: WatchFaceConfig,
+  targetMaxDim: number = SUPERSAMPLE_TARGET_DIM
+): WatchFaceConfig {
+  const { width, height, cornerRadius } = config.resolution;
+  const maxDim = Math.max(width, height);
+  if (maxDim <= 0 || maxDim === targetMaxDim) return config;
+  const scale = targetMaxDim / maxDim;
+  return {
+    ...config,
+    resolution: {
+      ...config.resolution,
+      width: Math.max(1, Math.round(width * scale)),
+      height: Math.max(1, Math.round(height * scale)),
+      cornerRadius: Math.round(cornerRadius * scale),
+    },
+  };
+}
 
 function isLayerVisible(config: WatchFaceConfig, id: LayerId): boolean {
   const found = config.layers.find((l) => l.id === id);
@@ -54,6 +85,7 @@ export function drawArcGaugeState(
   const endRad = ((arc.endAngleDeg - 90) * Math.PI) / 180;
   const clamped = Math.max(0, Math.min(1, progressRatio));
   const activeEndRad = startRad + (endRad - startRad) * clamped;
+  const scaledThickness = Math.max(1.5, arc.thickness * (minDim / 466));
 
   ctx.save();
   ctx.lineCap = 'round';
@@ -62,7 +94,7 @@ export function drawArcGaugeState(
     ctx.beginPath();
     ctx.arc(cx, cy, r, startRad, endRad, false);
     ctx.strokeStyle = arc.trackColor;
-    ctx.lineWidth = arc.thickness;
+    ctx.lineWidth = scaledThickness;
     ctx.stroke();
   }
 
@@ -70,9 +102,9 @@ export function drawArcGaugeState(
     ctx.beginPath();
     ctx.arc(cx, cy, r, startRad, activeEndRad, false);
     ctx.strokeStyle = arc.color;
-    ctx.lineWidth = arc.thickness;
+    ctx.lineWidth = scaledThickness;
     ctx.shadowColor = arc.color;
-    ctx.shadowBlur = 4;
+    ctx.shadowBlur = Math.max(3, 4 * (minDim / 466));
     ctx.stroke();
   }
 
@@ -114,6 +146,9 @@ export function formatWidgetText(
 
   switch (widget.type) {
     case 'timeDigital':
+      if (widget.layout === 'hourOnly') {
+        return formatLiveHourNumber(sys.hours24);
+      }
       return `${sys.displayHourStr}:${sys.minuteStr}`;
     case 'date':
       return sys.dateMMDD;
@@ -137,7 +172,8 @@ function getCachedGlyph(
   config: WatchFaceConfig,
   glyphMap?: Map<string, HTMLCanvasElement>
 ): HTMLCanvasElement {
-  const key = `${fontSet}:${role}:${char}`;
+  const fontKey = config.digital.activeCustomFontId ?? 'builtin';
+  const key = `${fontKey}:${config.digital.fontStyle}:${fontSet}:${role}:${char}`;
   let c = glyphMap?.get(key);
   if (!c) {
     c = renderGlyphCanvas(char, fontSet, config, { role });
@@ -192,6 +228,106 @@ export function drawDigitalWidgetsLive(
     const wy = height / 2 + widget.relY * minDim;
 
     if (widget.type === 'timeDigital') {
+      const layout = widget.layout ?? 'inline';
+
+      if (layout === 'hourOnly') {
+        const hourStr = formatLiveHourNumber(sys.hours24);
+        const hourCanvases = Array.from(hourStr).map((ch) =>
+          getCachedGlyph(ch, widget.fontSet, 'hours', config, glyphMap)
+        );
+        if (hourCanvases.length === 0) continue;
+        const scale = widget.scale;
+        const glyphW = hourCanvases[0].width * scale;
+        const stepAdvance = glyphW * 0.78;
+        const totalW = stepAdvance * (hourCanvases.length - 1) + glyphW;
+        const mainH = hourCanvases[0].height * scale;
+
+        let cursorX =
+          widget.align === 'center'
+            ? wx - totalW / 2
+            : widget.align === 'right'
+            ? wx - totalW
+            : wx;
+
+        if (config.digital.backdropPill?.enabled) {
+          const [pr, pg, pb] = hexToRgb(config.digital.backdropPill.color || '#090b0f');
+          const alpha = Math.max(0.1, Math.min(0.92, config.digital.backdropPill.opacity));
+          const padX = minDim * 0.044;
+          const padY = minDim * 0.024;
+          ctx.save();
+          roundedRectPath(
+            ctx,
+            cursorX - padX,
+            wy - mainH / 2 - padY,
+            totalW + padX * 2,
+            mainH + padY * 2,
+            (mainH + padY * 2) * 0.36
+          );
+          ctx.fillStyle = `rgba(${pr}, ${pg}, ${pb}, ${alpha.toFixed(3)})`;
+          ctx.fill();
+          ctx.restore();
+        }
+
+        for (const gCanvas of hourCanvases) {
+          ctx.drawImage(gCanvas, cursorX, wy - mainH / 2, gCanvas.width * scale, mainH);
+          cursorX += stepAdvance;
+        }
+        continue;
+      }
+
+      if (layout === 'stacked') {
+        const hourChars = Array.from(sys.displayHourStr).map((ch) =>
+          getCachedGlyph(ch, widget.fontSet, 'hours', config, glyphMap)
+        );
+        const minChars = Array.from(sys.minuteStr).map((ch) =>
+          getCachedGlyph(ch, widget.fontSet, 'minutes', config, glyphMap)
+        );
+        if (hourChars.length === 0 || minChars.length === 0) continue;
+
+        const scale = widget.scale;
+        const glyphW = hourChars[0].width * scale;
+        const stepAdvance = glyphW * 0.78;
+        const rowH = hourChars[0].height * scale;
+        const rowGap = rowH * 0.08;
+        const hourRowW = stepAdvance * (hourChars.length - 1) + glyphW;
+        const minRowW = stepAdvance * (minChars.length - 1) + glyphW;
+        const maxRowW = Math.max(hourRowW, minRowW);
+        const totalStackedH = rowH * 2 + rowGap;
+
+        if (config.digital.backdropPill?.enabled) {
+          const [pr, pg, pb] = hexToRgb(config.digital.backdropPill.color || '#090b0f');
+          const alpha = Math.max(0.1, Math.min(0.92, config.digital.backdropPill.opacity));
+          const padX = minDim * 0.036;
+          const padY = minDim * 0.022;
+          ctx.save();
+          roundedRectPath(
+            ctx,
+            wx - maxRowW / 2 - padX,
+            wy - totalStackedH / 2 - padY,
+            maxRowW + padX * 2,
+            totalStackedH + padY * 2,
+            minDim * 0.05
+          );
+          ctx.fillStyle = `rgba(${pr}, ${pg}, ${pb}, ${alpha.toFixed(3)})`;
+          ctx.fill();
+          ctx.restore();
+        }
+
+        const topY = wy - totalStackedH / 2;
+        const botY = topY + rowH + rowGap;
+        let hx = wx - hourRowW / 2;
+        for (const gCanvas of hourChars) {
+          ctx.drawImage(gCanvas, hx, topY, gCanvas.width * scale, rowH);
+          hx += stepAdvance;
+        }
+        let mx = wx - minRowW / 2;
+        for (const gCanvas of minChars) {
+          ctx.drawImage(gCanvas, mx, botY, gCanvas.width * scale, rowH);
+          mx += stepAdvance;
+        }
+        continue;
+      }
+
       const hourChars = Array.from(sys.displayHourStr).map((ch) =>
         getCachedGlyph(ch, widget.fontSet, 'hours', config, glyphMap)
       );
@@ -378,7 +514,7 @@ export function renderStaticBackgroundCanvas(
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
   const isPureDigital = config.displayMode === 'digital' || !config.hands.enabled;
   const intactMode = isUsingIntactArtwork(config);
 
@@ -521,26 +657,35 @@ export function renderLiveWatchFrame(
     const minRad = (minVal / 60) * Math.PI * 2;
     const secRad = (secVal / 60) * Math.PI * 2;
 
+    const stripW = Math.max(64, Math.ceil(Math.min(width, height) * 0.24));
+    const cx = width / 2;
+    const cy = height / 2;
+    const handStrip = document.createElement('canvas');
+    handStrip.width = stripW;
+    handStrip.height = height;
+    const octx = handStrip.getContext('2d', { willReadFrequently: true })!;
+    const lightShadow = getLightDirectionalShadowOffset(config);
+
     const drawRotatedHandWithGlobalShadow = (
       kind: 'hour' | 'minute' | 'second',
       angleRad: number
     ) => {
-      const off = document.createElement('canvas');
-      off.width = width;
-      off.height = height;
-      const octx = off.getContext('2d')!;
-      octx.translate(width / 2, height / 2);
-      octx.rotate(angleRad);
-      octx.translate(-width / 2, -height / 2);
+      octx.clearRect(0, 0, stripW, height);
+      octx.save();
+      octx.translate(stripW / 2 - cx, 0);
       renderHandVertical(octx, kind, config, false);
+      octx.restore();
 
-      // Soft drop shadow offset in global dial light coordinates (+4px, +6px)
+      // Canvas 2D shadowOffsetX/Y are evaluated in screen space (after rotation),
+      // so rotating ctx around (cx, cy) preserves fixed lightAngleDeg shadows while cutting blur pixels ~5x.
       ctx.save();
       ctx.shadowColor = 'rgba(8, 8, 8, 0.72)';
-      ctx.shadowBlur = config.hands.shadowBlur;
-      ctx.shadowOffsetX = config.hands.shadowOffsetX;
-      ctx.shadowOffsetY = config.hands.shadowOffsetY;
-      ctx.drawImage(off, 0, 0);
+      ctx.shadowBlur = Math.min(12, lightShadow.blur);
+      ctx.shadowOffsetX = lightShadow.offsetX;
+      ctx.shadowOffsetY = lightShadow.offsetY;
+      ctx.translate(cx, cy);
+      ctx.rotate(angleRad);
+      ctx.drawImage(handStrip, -stripW / 2, -cy);
       ctx.restore();
     };
 
@@ -568,45 +713,109 @@ export function renderLiveWatchFrame(
 }
 
 /**
+ * Renders a live watch frame internally on a 2048px-class supersampled buffer,
+ * then smoothly downscales with bicubic-quality smoothing into the target viewport.
+ */
+export function renderSupersampledWatchFrame(
+  targetCtx: CanvasRenderingContext2D,
+  targetConfig: WatchFaceConfig,
+  sim: SimulationState,
+  cachedHighResStatic?: HTMLCanvasElement,
+  scratchHighResCanvas?: HTMLCanvasElement,
+  glyphCache?: Map<string, HTMLCanvasElement>
+): void {
+  const highConfig = scaleConfigToMaxDim(targetConfig, SUPERSAMPLE_TARGET_DIM);
+  const { width: hw, height: hh } = highConfig.resolution;
+  const { width: tw, height: th } = targetConfig.resolution;
+
+  const highCanvas = scratchHighResCanvas ?? document.createElement('canvas');
+  if (highCanvas.width !== hw) highCanvas.width = hw;
+  if (highCanvas.height !== hh) highCanvas.height = hh;
+
+  const hctx = highCanvas.getContext('2d', { willReadFrequently: true });
+  if (!hctx) return;
+
+  const applyRgb565 = Boolean(sim.hardwareRgb565Preview);
+  renderLiveWatchFrame(
+    hctx,
+    highConfig,
+    applyRgb565 ? { ...sim, hardwareRgb565Preview: false } : sim,
+    cachedHighResStatic &&
+      cachedHighResStatic.width === hw &&
+      cachedHighResStatic.height === hh
+      ? cachedHighResStatic
+      : undefined,
+    glyphCache
+  );
+
+  targetCtx.save();
+  targetCtx.clearRect(0, 0, tw, th);
+  targetCtx.imageSmoothingEnabled = true;
+  targetCtx.imageSmoothingQuality = 'high';
+  targetCtx.drawImage(highCanvas, 0, 0, tw, th);
+
+  if (applyRgb565) {
+    const frameData = targetCtx.getImageData(0, 0, tw, th);
+    floydSteinbergRGB565(frameData, sim.fitCloudBlackGuard);
+    targetCtx.putImageData(frameData, 0, 0);
+  }
+  targetCtx.restore();
+}
+
+/**
  * Generates the complete set of cropped, quantized & dithered hardware sprites
  * for VeryFit (.iwf / .iwf.lz) and FitCloudPro (.bin TBUI) compilers.
+ * Internally renders masters at 2048px supersampled precision before clamping strictly
+ * to true smartwatch hardware dimensions (never exporting 1080x1080 to a watch).
  */
 export function compileWatchSprites(
   rawConfig: WatchFaceConfig,
   sim: SimulationState
 ): CompiledWatchAssets {
-  const isFhdMaster =
-    rawConfig.resolution.width > 600 || rawConfig.resolution.height > 600;
-  const config: WatchFaceConfig = isFhdMaster
-    ? {
-        ...rawConfig,
-        resolution:
-          rawConfig.resolution.shape === 'round'
-            ? {
-                id: '466x466',
-                label: '466×466 Round (Super-Sampled from 1080p FHD)',
-                width: 466,
-                height: 466,
-                shape: 'round',
-                cornerRadius: 233,
-              }
-            : {
-                id: '368x448',
-                label: '368×448 Squircle (Super-Sampled from 1080p FHD)',
-                width: 368,
-                height: 448,
-                shape: 'squircle',
-                cornerRadius: 82,
-              },
-      }
-    : rawConfig;
+  const clampedSpec = clampWatchExportResolution(rawConfig.resolution);
+  const config: WatchFaceConfig =
+    rawConfig.resolution.width === clampedSpec.width &&
+    rawConfig.resolution.height === clampedSpec.height &&
+    rawConfig.resolution.shape === clampedSpec.shape
+      ? { ...rawConfig, resolution: clampedSpec }
+      : adaptWatchFaceToResolution(rawConfig, clampedSpec);
 
+  const highConfig = scaleConfigToMaxDim(config, SUPERSAMPLE_TARGET_DIM);
   const { width, height } = config.resolution;
+  const { width: hw, height: hh } = highConfig.resolution;
   const cx = width / 2;
   const cy = height / 2;
 
-  // 1. Background sprite (full watch dimensions)
-  const bgCanvas = renderStaticBackgroundCanvas(config, sim);
+  const downscaleScratch = document.createElement('canvas');
+  downscaleScratch.width = width;
+  downscaleScratch.height = height;
+  const downscaleCtx = downscaleScratch.getContext('2d', { willReadFrequently: true })!;
+  downscaleCtx.imageSmoothingEnabled = true;
+  downscaleCtx.imageSmoothingQuality = 'high';
+
+  const downscaleHighRes = (
+    src: HTMLCanvasElement,
+    targetW = width,
+    targetH = height
+  ): HTMLCanvasElement => {
+    if (downscaleScratch.width !== targetW) downscaleScratch.width = targetW;
+    if (downscaleScratch.height !== targetH) downscaleScratch.height = targetH;
+    downscaleCtx.clearRect(0, 0, targetW, targetH);
+    downscaleCtx.imageSmoothingEnabled = true;
+    downscaleCtx.imageSmoothingQuality = 'high';
+    downscaleCtx.drawImage(src, 0, 0, targetW, targetH);
+    return downscaleScratch;
+  };
+
+  // Single pooled 2048px CPU-backed supersample scratch canvas for hands, center cap & arcs
+  const hiScratch = document.createElement('canvas');
+  hiScratch.width = hw;
+  hiScratch.height = hh;
+  const hiCtx = hiScratch.getContext('2d', { willReadFrequently: true })!;
+
+  // 1. Background sprite (2048px supersampled -> smooth hardware target resolution)
+  const bgHighCanvas = renderStaticBackgroundCanvas(highConfig, sim);
+  const bgCanvas = downscaleHighRes(bgHighCanvas, width, height);
   const background = buildQuantizedSprite({
     id: 'background',
     category: 'background',
@@ -619,7 +828,7 @@ export function compileWatchSprites(
     fitCloudBlackGuard: true,
   });
 
-  // 2. Preview thumbnail (240x240 or 240x280 rounded)
+  // 2. Preview thumbnail (240x240 or 240xH rounded) supersampled from 2048px
   const prevW = 240;
   const prevH =
     config.resolution.shape === 'round'
@@ -628,19 +837,22 @@ export function compileWatchSprites(
   const fullLiveCanvas = document.createElement('canvas');
   fullLiveCanvas.width = width;
   fullLiveCanvas.height = height;
-  renderLiveWatchFrame(
+  renderSupersampledWatchFrame(
     fullLiveCanvas.getContext('2d', { willReadFrequently: true })!,
     config,
     {
       ...sim,
       hardwareRgb565Preview: true,
-    }
+    },
+    bgHighCanvas
   );
 
   const prevCanvas = document.createElement('canvas');
   prevCanvas.width = prevW;
   prevCanvas.height = prevH;
-  const pctx = prevCanvas.getContext('2d')!;
+  const pctx = prevCanvas.getContext('2d', { willReadFrequently: true })!;
+  pctx.imageSmoothingEnabled = true;
+  pctx.imageSmoothingQuality = 'high';
   clipWatchBoundary(
     pctx,
     prevW,
@@ -651,15 +863,14 @@ export function compileWatchSprites(
   pctx.drawImage(fullLiveCanvas, 0, 0, prevW, prevH);
   const previewBytes = dataUrlToBytes(prevCanvas.toDataURL('image/png'));
 
-  // 3. Analog hands (tight-cropped with exact rotation pivot)
+  // 3. Analog hands (rendered at 2048px, downscaled & tight-cropped with exact rotation pivot)
   const makeHandSprite = (
     kind: 'hour' | 'minute' | 'second',
     label: string
   ): CroppedSprite => {
-    const c = document.createElement('canvas');
-    c.width = width;
-    c.height = height;
-    renderHandVertical(c.getContext('2d')!, kind, config, true);
+    hiCtx.clearRect(0, 0, hw, hh);
+    renderHandVertical(hiCtx, kind, highConfig, true);
+    const c = downscaleHighRes(hiScratch, width, height);
     return buildQuantizedSprite({
       id: `hand_${kind}`,
       category: 'hand',
@@ -677,11 +888,10 @@ export function compileWatchSprites(
   const handMinute = makeHandSprite('minute', 'Minute Hand (3D Faceted)');
   const handSecond = makeHandSprite('second', 'Second Hand + Lume Pip');
 
-  // 4. Center Pin Cap sprite
-  const capCanvas = document.createElement('canvas');
-  capCanvas.width = width;
-  capCanvas.height = height;
-  drawCenterPinCap(capCanvas.getContext('2d')!, config);
+  // 4. Center Pin Cap sprite (supersampled)
+  hiCtx.clearRect(0, 0, hw, hh);
+  drawCenterPinCap(hiCtx, highConfig);
+  const capCanvas = downscaleHighRes(hiScratch, width, height);
   const centerCap = buildQuantizedSprite({
     id: 'center_cap',
     category: 'cap',
@@ -694,7 +904,7 @@ export function compileWatchSprites(
     fitCloudBlackGuard: true,
   });
 
-  // 5. Discrete Complication Arc Frame Sprites
+  // 5. Discrete Complication Arc Frame Sprites (supersampled)
   const arcFrames: Record<string, CroppedSprite[]> = {};
   for (const arc of config.complications.arcs) {
     if (!arc.enabled) continue;
@@ -702,10 +912,9 @@ export function compileWatchSprites(
     const previewFrames = Math.min(arc.frameCount, 8);
     for (let f = 0; f < previewFrames; f++) {
       const ratio = f / Math.max(1, previewFrames - 1);
-      const ac = document.createElement('canvas');
-      ac.width = width;
-      ac.height = height;
-      drawArcGaugeState(ac.getContext('2d')!, arc, config, ratio, false);
+      hiCtx.clearRect(0, 0, hw, hh);
+      drawArcGaugeState(hiCtx, arc, highConfig, ratio, false);
+      const ac = downscaleHighRes(hiScratch, width, height);
       frames.push(
         buildQuantizedSprite({
           id: `${arc.id}_f${f}`,
@@ -725,12 +934,25 @@ export function compileWatchSprites(
 
   // 6. Custom Anti-Aliased Bitmap Typography Glyphs
   const glyphs: GlyphSpriteEntry[] = [];
-  const activeFontSets = new Set<'time' | 'metrics' | 'small'>(['metrics', 'small']);
+  const activeCustomFont = resolveActiveCustomFont(config.digital);
+  const orderedFontSets: Array<'time' | 'metrics' | 'small'> = [];
+  const seenFontSets = new Set<'time' | 'metrics' | 'small'>();
+  const pushSet = (fs: 'time' | 'metrics' | 'small') => {
+    if (!seenFontSets.has(fs)) {
+      seenFontSets.add(fs);
+      orderedFontSets.push(fs);
+    }
+  };
   for (const w of config.digital.widgets) {
-    if (w.enabled) activeFontSets.add(w.fontSet);
+    if (w.enabled) pushSet(w.fontSet);
   }
+  if (activeCustomFont) {
+    pushSet('time');
+  }
+  pushSet('metrics');
+  pushSet('small');
 
-  for (const fontSet of activeFontSets) {
+  for (const fontSet of orderedFontSets) {
     const role: GlyphRole =
       fontSet === 'time' ? 'hours' : fontSet === 'metrics' ? 'minutes' : 'date';
     for (const ch of GLYPH_CHARSET) {
@@ -747,10 +969,13 @@ export function compileWatchSprites(
           : ch === '°'
           ? 'deg'
           : `char_${ch}`;
+      const fontLabelSuffix = activeCustomFont
+        ? ` · ${activeCustomFont.name}`
+        : '';
       const sprite = buildQuantizedSprite({
         id: `font_${fontSet}_${safeName}`,
         category: 'glyph',
-        label: `Glyph '${ch}' (${fontSet})`,
+        label: `Glyph '${ch}' (${fontSet}${fontLabelSuffix})`,
         sourceCanvas: gCanvas,
         centerX: gCanvas.width / 2,
         centerY: gCanvas.height / 2,

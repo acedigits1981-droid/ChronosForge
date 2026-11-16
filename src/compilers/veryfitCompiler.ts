@@ -5,6 +5,10 @@ import {
   WatchFaceConfig,
 } from '../types/watchface';
 import { compileWatchSprites } from '../engine/renderer';
+import {
+  adaptWatchFaceToResolution,
+  clampWatchExportResolution,
+} from '../presets/watchPresets';
 import { compressIwfLz4, fastlz1Compress } from './compression';
 
 export interface VeryFitExportPackage {
@@ -28,7 +32,14 @@ export async function buildVeryFitPackage(
   lzAlgorithm: 'lz4' | 'fastlz' = 'lz4',
   precompiled?: CompiledWatchAssets
 ): Promise<VeryFitExportPackage> {
-  const assets = precompiled ?? compileWatchSprites(config, sim);
+  const targetSpec = clampWatchExportResolution(config.resolution);
+  const clampedConfig =
+    config.resolution.width === targetSpec.width &&
+    config.resolution.height === targetSpec.height &&
+    config.resolution.shape === targetSpec.shape
+      ? config
+      : adaptWatchFaceToResolution(config, targetSpec);
+  const assets = precompiled ?? compileWatchSprites(clampedConfig, sim);
   const zip = new JSZip();
 
   // 1. Add preview & background PNGs
@@ -56,9 +67,11 @@ export async function buildVeryFitPackage(
   const fontJsonString = JSON.stringify(flatFontJson);
   zip.file('font.json', fontJsonString);
 
-  const { width, height } = config.resolution;
+  const width = assets.width;
+  const height = assets.height;
   const minDim = Math.min(width, height);
-  const isPureDigital = config.displayMode === 'digital' || !config.hands.enabled;
+  const isPureDigital =
+    clampedConfig.displayMode === 'digital' || !clampedConfig.hands.enabled;
 
   // 3. Add analog hand & center cap PNGs only when analog/hybrid hands are enabled
   if (!isPureDigital && config.hands.enabled) {

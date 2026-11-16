@@ -29,6 +29,7 @@ import {
   ExtractedWatchUiColors,
 } from '../utils/paletteExtractor';
 import { CustomImageUploadControls } from './CustomImageUploadControls';
+import { FontManagerDrawer } from './FontManagerDrawer';
 import { HslColorPicker } from './HslColorPicker';
 
 interface LayerSidebarProps {
@@ -47,6 +48,7 @@ export const LayerSidebar: React.FC<LayerSidebarProps> = ({
   const [activeColorId, setActiveColorId] = useState<string | null>('dial-base');
   const [autoPickedHex, setAutoPickedHex] = useState<string | null>(null);
   const [isPickingColor, setIsPickingColor] = useState(false);
+  const [fontDrawerOpen, setFontDrawerOpen] = useState(false);
 
   const toggleColorPicker = (id: string) => {
     setActiveColorId((prev) => (prev === id ? null : id));
@@ -211,6 +213,14 @@ export const LayerSidebar: React.FC<LayerSidebarProps> = ({
           })}
         </div>
       </div>
+
+      {/* Font Management Drawer (.ttf / .otf custom glyph atlas) */}
+      <FontManagerDrawer
+        config={config}
+        onChangeConfig={onChangeConfig}
+        isOpen={fontDrawerOpen}
+        onToggleOpen={() => setFontDrawerOpen((prev) => !prev)}
+      />
 
       {/* Section 2: Material & Shader Inspector */}
       <div className="p-4 flex-1 space-y-4">
@@ -519,13 +529,14 @@ export const LayerSidebar: React.FC<LayerSidebarProps> = ({
 
             <label className="block space-y-1">
               <div className="flex justify-between">
-                <span className="text-slate-400">Light Source Azimuth</span>
+                <span className="text-slate-400">Studio Light Angle</span>
                 <span className="font-mono text-slate-200">
                   {config.dial.lightAngleDeg}°
                 </span>
               </div>
               <input
                 type="range"
+                aria-label="Studio Light Angle"
                 min={0}
                 max={360}
                 value={config.dial.lightAngleDeg}
@@ -713,6 +724,14 @@ export const LayerSidebar: React.FC<LayerSidebarProps> = ({
                 <option value="tacticalStencil">Tactical Monospace Readout</option>
               </select>
             </label>
+
+            <button
+              type="button"
+              onClick={() => setFontDrawerOpen(true)}
+              className="w-full rounded-lg bg-amber-600/15 hover:bg-amber-600/25 border border-amber-500/45 px-2.5 py-1.5 text-[11px] font-semibold text-amber-200 cursor-pointer"
+            >
+              Manage Custom .TTF / .OTF Fonts
+            </button>
 
             <div className="space-y-2">
               <div className="space-y-1">
@@ -968,35 +987,148 @@ export const LayerSidebar: React.FC<LayerSidebarProps> = ({
               )}
             </div>
 
-            <div className="space-y-1.5 pt-2 border-t border-slate-800">
+            <div className="space-y-2 pt-2 border-t border-slate-800">
               <span className="text-slate-400 block font-medium">
-                Active Digital Readouts
+                Active Digital Readouts &amp; Position (or Drag on Watch)
               </span>
               {config.digital.widgets.map((w, i) => (
-                <label
+                <div
                   key={w.id}
-                  className="flex items-center justify-between bg-[#111622] px-2.5 py-1.5 rounded border border-slate-800"
+                  className="bg-[#111622] px-2.5 py-2 rounded border border-slate-800 space-y-2"
                 >
-                  <span className="flex items-center gap-2 text-slate-200">
-                    <input
-                      type="checkbox"
-                      checked={w.enabled}
-                      onChange={(e) => {
-                        const nextW = [...config.digital.widgets];
-                        nextW[i] = { ...w, enabled: e.target.checked };
-                        onChangeConfig({
-                          ...config,
-                          digital: { ...config.digital, widgets: nextW },
-                        });
-                      }}
-                      className="accent-orange-500"
-                    />
-                    {w.label}
-                  </span>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    {w.fontSet}
-                  </span>
-                </label>
+                  <label className="flex items-center justify-between">
+                    <span className="flex items-center gap-2 text-slate-200">
+                      <input
+                        type="checkbox"
+                        checked={w.enabled}
+                        onChange={(e) => {
+                          const nextW = [...config.digital.widgets];
+                          nextW[i] = { ...w, enabled: e.target.checked };
+                          onChangeConfig({
+                            ...config,
+                            digital: { ...config.digital, widgets: nextW },
+                          });
+                        }}
+                        className="accent-orange-500"
+                      />
+                      {w.label}
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-400">
+                      {w.fontSet}
+                    </span>
+                  </label>
+
+                  {w.enabled && (
+                    <div className="space-y-1.5 pt-1 border-t border-slate-800/70">
+                      {w.type === 'timeDigital' && (
+                        <div className="grid grid-cols-3 gap-1">
+                          {(
+                            [
+                              ['inline', 'HH:MM'],
+                              ['stacked', 'Stacked'],
+                              ['hourOnly', 'Hour Only'],
+                            ] as const
+                          ).map(([lk, lbl]) => (
+                            <button
+                              key={lk}
+                              type="button"
+                              onClick={() => {
+                                const nextW = [...config.digital.widgets];
+                                nextW[i] = { ...w, layout: lk };
+                                onChangeConfig({
+                                  ...config,
+                                  digital: { ...config.digital, widgets: nextW },
+                                });
+                              }}
+                              className={`py-1 rounded text-[10px] font-semibold cursor-pointer ${
+                                (w.layout ?? 'inline') === lk
+                                  ? 'bg-sky-600 text-white'
+                                  : 'bg-[#0b0f17] text-slate-300 hover:text-white'
+                              }`}
+                            >
+                              {lbl}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      <label className="block space-y-0.5">
+                        <div className="flex justify-between text-[10px] text-slate-400">
+                          <span>X Position</span>
+                          <span className="font-mono text-sky-300">
+                            {Math.round(w.relX * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-0.42}
+                          max={0.42}
+                          step={0.01}
+                          value={w.relX}
+                          onChange={(e) => {
+                            const nextW = [...config.digital.widgets];
+                            nextW[i] = { ...w, relX: Number(e.target.value) };
+                            onChangeConfig({
+                              ...config,
+                              digital: { ...config.digital, widgets: nextW },
+                            });
+                          }}
+                          className="w-full accent-sky-500"
+                        />
+                      </label>
+
+                      <label className="block space-y-0.5">
+                        <div className="flex justify-between text-[10px] text-slate-400">
+                          <span>Y Position</span>
+                          <span className="font-mono text-sky-300">
+                            {Math.round(w.relY * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-0.42}
+                          max={0.42}
+                          step={0.01}
+                          value={w.relY}
+                          onChange={(e) => {
+                            const nextW = [...config.digital.widgets];
+                            nextW[i] = { ...w, relY: Number(e.target.value) };
+                            onChangeConfig({
+                              ...config,
+                              digital: { ...config.digital, widgets: nextW },
+                            });
+                          }}
+                          className="w-full accent-sky-500"
+                        />
+                      </label>
+
+                      <label className="block space-y-0.5">
+                        <div className="flex justify-between text-[10px] text-slate-400">
+                          <span>Size Scale</span>
+                          <span className="font-mono text-sky-300">
+                            {w.scale.toFixed(2)}×
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.45}
+                          max={3.2}
+                          step={0.05}
+                          value={w.scale}
+                          onChange={(e) => {
+                            const nextW = [...config.digital.widgets];
+                            nextW[i] = { ...w, scale: Number(e.target.value) };
+                            onChangeConfig({
+                              ...config,
+                              digital: { ...config.digital, widgets: nextW },
+                            });
+                          }}
+                          className="w-full accent-sky-500"
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
           </div>

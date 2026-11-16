@@ -483,3 +483,95 @@ test('extractWatchUiAccentColorsFromRgba isolates pink/red markers off pitch-bla
   assert.equal(updated.hands.hourMinuteMetalColor, colors.metalToneColor);
   assert.equal(updated.hands.lumeColor, colors.secondaryColor);
 });
+
+test('clampWatchExportResolution clamps 1080x1080 masters and honors HardwareResolutionLock', async () => {
+  const { RESOLUTION_SPECS, clampWatchExportResolution } = await import(
+    '../presets/watchPresets'
+  );
+
+  const clampedRound = clampWatchExportResolution(RESOLUTION_SPECS[0]);
+  assert.equal(clampedRound.width, 466);
+  assert.equal(clampedRound.height, 466);
+  assert.equal(clampedRound.shape, 'round');
+  assert.equal(clampedRound.isFullHdMaster, false);
+
+  const clampedSquare = clampWatchExportResolution(RESOLUTION_SPECS[1]);
+  assert.equal(clampedSquare.width, 368);
+  assert.equal(clampedSquare.height, 448);
+  assert.equal(clampedSquare.shape, 'squircle');
+  assert.equal(clampedSquare.isFullHdMaster, false);
+
+  const lockedRound = clampWatchExportResolution(RESOLUTION_SPECS[0], {
+    lcdWidth: 360,
+    lcdHeight: 360,
+    isRound: true,
+  });
+  assert.equal(lockedRound.width, 360);
+  assert.equal(lockedRound.height, 360);
+  assert.equal(lockedRound.shape, 'round');
+
+  const lockedSquircle = clampWatchExportResolution(RESOLUTION_SPECS[1], {
+    lcdWidth: 240,
+    lcdHeight: 284,
+    isRound: false,
+  });
+  assert.equal(lockedSquircle.width, 240);
+  assert.equal(lockedSquircle.height, 284);
+  assert.equal(lockedSquircle.shape, 'squircle');
+});
+
+test('scaleConfigToMaxDim scales round and squircle configs to 2048px internal supersampling preserving aspect', async () => {
+  const { WATCH_PRESETS, RESOLUTION_SPECS, adaptWatchFaceToResolution } =
+    await import('../presets/watchPresets');
+  const { scaleConfigToMaxDim, SUPERSAMPLE_TARGET_DIM } = await import(
+    '../engine/renderer'
+  );
+
+  assert.equal(SUPERSAMPLE_TARGET_DIM, 2048);
+  const roundScaled = scaleConfigToMaxDim(WATCH_PRESETS[0], SUPERSAMPLE_TARGET_DIM);
+  assert.equal(roundScaled.resolution.width, 2048);
+  assert.equal(roundScaled.resolution.height, 2048);
+
+  const sq368 = adaptWatchFaceToResolution(
+    WATCH_PRESETS[0],
+    RESOLUTION_SPECS.find((r) => r.id === '368x448')!
+  );
+  const sqScaled = scaleConfigToMaxDim(sq368, SUPERSAMPLE_TARGET_DIM);
+  assert.equal(sqScaled.resolution.height, 2048);
+  assert.equal(sqScaled.resolution.width, Math.round((368 * 2048) / 448));
+});
+
+test('getLightDirectionalShadowOffset tracks lightAngleDeg and scales proportionally with resolution', async () => {
+  const { WATCH_PRESETS, RESOLUTION_SPECS, adaptWatchFaceToResolution } =
+    await import('../presets/watchPresets');
+  const { getLightDirectionalShadowOffset } = await import('../engine/hands');
+
+  const cfg466 = adaptWatchFaceToResolution(
+    WATCH_PRESETS[0],
+    RESOLUTION_SPECS.find((r) => r.id === '466x466')!
+  );
+  const cfg2048 = adaptWatchFaceToResolution(cfg466, {
+    ...cfg466.resolution,
+    width: 2048,
+    height: 2048,
+    cornerRadius: 1024,
+  });
+
+  const s0 = getLightDirectionalShadowOffset({
+    ...cfg466,
+    dial: { ...cfg466.dial, lightAngleDeg: 0 },
+  });
+  const s180 = getLightDirectionalShadowOffset({
+    ...cfg466,
+    dial: { ...cfg466.dial, lightAngleDeg: 180 },
+  });
+  assert.ok(s0.offsetX < 0);
+  assert.ok(s180.offsetX > 0);
+
+  const s2048 = getLightDirectionalShadowOffset({
+    ...cfg2048,
+    dial: { ...cfg2048.dial, lightAngleDeg: 0 },
+  });
+  assert.ok(Math.abs(s2048.offsetX) > Math.abs(s0.offsetX) * 3.5);
+});
+

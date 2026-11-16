@@ -4,6 +4,7 @@ import {
   Download,
   FileUp,
   Gem,
+  Lock,
   Sparkles,
 } from 'lucide-react';
 import {
@@ -12,6 +13,10 @@ import {
   SQUARE_WATCH_PRESETS,
   WATCH_PRESETS,
 } from '../presets/watchPresets';
+import {
+  formatHardwareLockBadgeText,
+  HardwareResolutionLock,
+} from '../types/nativeBridge';
 import { ResolutionSpec, WatchDisplayMode, WatchFaceConfig } from '../types/watchface';
 import { usePWAInstall } from './usePWAInstall';
 
@@ -28,6 +33,7 @@ interface TopBarProps {
   onExportFitCloud: () => void;
   onSwitchToEasy?: () => void;
   isExporting: boolean;
+  hardwareLock?: HardwareResolutionLock | null;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -43,6 +49,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onExportFitCloud,
   onSwitchToEasy,
   isExporting,
+  hardwareLock = null,
 }) => {
   const { isInstallable, install } = usePWAInstall();
 
@@ -103,7 +110,7 @@ export const TopBar: React.FC<TopBarProps> = ({
             onClick={onOpenWebBle}
             className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer py-1"
           >
-            WebBLE Watch Flasher
+            Send to Watch
           </button>
           {isInstallable && (
             <button
@@ -117,6 +124,19 @@ export const TopBar: React.FC<TopBarProps> = ({
         </nav>
 
         <div className="flex items-center gap-2 shrink-0">
+          {hardwareLock && (
+            <span
+              data-testid="topbar-hardware-lock-badge"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-950/75 border border-emerald-500/60 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-200 whitespace-nowrap"
+            >
+              <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              {formatHardwareLockBadgeText(
+                hardwareLock.lcdWidth,
+                hardwareLock.lcdHeight,
+                hardwareLock.isRound
+              )}
+            </span>
+          )}
           <button
             type="button"
             disabled={isExporting}
@@ -187,7 +207,9 @@ export const TopBar: React.FC<TopBarProps> = ({
           >
             <button
               type="button"
+              disabled={Boolean(hardwareLock)}
               onClick={() => {
+                if (hardwareLock) return;
                 if (config.resolution.shape !== 'round') {
                   onSelectResolution(
                     config.resolution.isFullHdMaster ||
@@ -197,7 +219,7 @@ export const TopBar: React.FC<TopBarProps> = ({
                   );
                 }
               }}
-              className={`px-2.5 py-1 rounded-md font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`px-2.5 py-1 rounded-md font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
                 config.resolution.shape === 'round'
                   ? 'bg-orange-600 text-white'
                   : 'text-slate-300 hover:text-white'
@@ -207,7 +229,9 @@ export const TopBar: React.FC<TopBarProps> = ({
             </button>
             <button
               type="button"
+              disabled={Boolean(hardwareLock)}
               onClick={() => {
+                if (hardwareLock) return;
                 if (config.resolution.shape !== 'squircle') {
                   onSelectResolution(
                     config.resolution.isFullHdMaster ||
@@ -217,7 +241,7 @@ export const TopBar: React.FC<TopBarProps> = ({
                   );
                 }
               }}
-              className={`px-2.5 py-1 rounded-md font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`px-2.5 py-1 rounded-md font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
                 config.resolution.shape === 'squircle'
                   ? 'bg-orange-600 text-white'
                   : 'text-slate-300 hover:text-white'
@@ -263,15 +287,26 @@ export const TopBar: React.FC<TopBarProps> = ({
             </span>
             <select
               aria-label="Target Geometry"
-              value={config.resolution.id}
+              disabled={Boolean(hardwareLock)}
+              value={hardwareLock ? '__locked__' : config.resolution.id}
               onChange={(e) => {
+                if (hardwareLock) return;
                 const found = RESOLUTION_SPECS.find(
                   (r) => r.id === e.target.value
                 );
                 if (found) onSelectResolution(found);
               }}
-              className="rounded-lg bg-[#131824] border border-slate-700/80 px-2.5 py-1.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-orange-500"
+              className="rounded-lg bg-[#131824] border border-slate-700/80 px-2.5 py-1.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-orange-500 disabled:opacity-65 disabled:cursor-not-allowed"
             >
+              {hardwareLock && (
+                <option value="__locked__">
+                  {formatHardwareLockBadgeText(
+                    hardwareLock.lcdWidth,
+                    hardwareLock.lcdHeight,
+                    hardwareLock.isRound
+                  )}
+                </option>
+              )}
               {RESOLUTION_SPECS.map((r) => (
                 <option key={r.id} value={r.id}>
                   {r.label}
@@ -304,10 +339,10 @@ export const TopBar: React.FC<TopBarProps> = ({
           <button
             type="button"
             onClick={onOpenWebBle}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800/90 hover:bg-slate-700/90 border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            <Bluetooth className="w-3.5 h-3.5 text-sky-400" />
-            WebBLE Flash
+            <Bluetooth className="w-3.5 h-3.5" />
+            Send to Watch
           </button>
 
           <button

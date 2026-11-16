@@ -17,7 +17,11 @@ import {
   drawDialPlate,
   isUsingIntactArtwork,
 } from '../engine/materials';
-import { renderLiveWatchFrame } from '../engine/renderer';
+import {
+  renderSupersampledWatchFrame,
+  scaleConfigToMaxDim,
+  SUPERSAMPLE_TARGET_DIM,
+} from '../engine/renderer';
 import {
   RESOLUTION_SPECS,
   ROUND_WATCH_PRESETS,
@@ -28,11 +32,18 @@ import {
   SimulationState,
   WatchFaceConfig,
 } from '../types/watchface';
+import { HardwareResolutionLock } from '../types/nativeBridge';
 import {
   getCachedCustomImageSync,
   loadCustomImageAndPalette,
 } from '../utils/paletteExtractor';
 import { getSystemClockState } from '../utils/systemClock';
+import {
+  clientDeltaToWatchRelDelta,
+  getPrimaryTimeWidget,
+  updatePrimaryTimeWidget,
+} from '../utils/digitalPlacement';
+import { ensureConfigFontsRegistered } from '../utils/customFontManager';
 import { processUploadedDialImageFile } from './CustomImageUploadControls';
 
 interface WatchViewportProps {
@@ -43,6 +54,8 @@ interface WatchViewportProps {
   onSelectPreset: (preset: WatchFaceConfig) => void;
   onSelectResolution: (res: ResolutionSpec) => void;
   onOpenLadiesCollection: () => void;
+  pauseRender?: boolean;
+  hardwareLock?: HardwareResolutionLock | null;
 }
 
 export const WatchViewport: React.FC<WatchViewportProps> = ({
@@ -53,11 +66,14 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
   onSelectPreset,
   onSelectResolution,
   onOpenLadiesCollection,
+  pauseRender = false,
+  hardwareLock = null,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cachedDialPlateRef = useRef<HTMLCanvasElement | null>(null);
   const cachedStaticDialRef = useRef<HTMLCanvasElement | null>(null);
+  const liveHighResCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const glyphCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const simRef = useRef<SimulationState>(sim);
   simRef.current = sim;
@@ -71,7 +87,16 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
   );
   const [dialPlateRevision, setDialPlateRevision] = useState(0);
   const [imageLoadRev, setImageLoadRev] = useState(0);
+  const [fontLoadRev, setFontLoadRev] = useState(0);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isDraggingClock, setIsDraggingClock] = useState(false);
+  const dragClockRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origRelX: number;
+    origRelY: number;
+  } | null>(null);
   const [clockSnapshot, setClockSnapshot] = useState(() =>
     getSystemClockState(new Date())
   );
@@ -105,6 +130,23 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
     config.dial.intactArtworkUrl,
   ]);
 
+  // Ensure any uploaded custom .ttf/.otf fonts are registered with FontFace API
+  useEffect(() => {
+    let cancelled = false;
+    if (!config.digital.customFonts?.length) return;
+    ensureConfigFontsRegistered(config)
+      .then((didLoad) => {
+        if (!cancelled && didLoad) {
+          glyphCacheRef.current.clear();
+          setFontLoadRev((r) => r + 1);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [config.digital.customFonts, config.digital.activeCustomFontId]);
+
   const dialVisible = config.layers.find((l) => l.id === 'dial')?.visible ?? true;
   const bezelVisible = config.layers.find((l) => l.id === 'bezel')?.visible ?? true;
 
@@ -125,21 +167,30 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
   const previewConfigRef = useRef<WatchFaceConfig>(previewConfig);
   previewConfigRef.current = previewConfig;
 
-  // 1. Rebuild procedural dial plate shader or custom framed photo (RAF-coalesced)
+  const highResConfig = useMemo<WatchFaceConfig>(
+    () => scaleConfigToMaxDim(previewConfig, SUPERSAMPLE_TARGET_DIM),
+    [previewConfig]
+  );
+  const highResConfigRef = useRef<WatchFaceConfig>(highResConfig);
+  highResConfigRef.current = highResConfig;
+
+  // 1. Rebuild procedural dial plate shader or custom framed photo at 2048px-class supersampling
   useEffect(() => {
     const rafId = window.requestAnimationFrame(() => {
-      const pCfg = previewConfigRef.current;
-      const { width: pw, height: ph } = pCfg.resolution;
-      const plateCanvas = document.createElement('canvas');
-      plateCanvas.width = pw;
-      plateCanvas.height = ph;
+      const hCfg = highResConfigRef.current;
+      const { width: hw, height: hh } = hCfg.resolution;
+      const plateCanvas =
+        cachedDialPlateRef.current ?? document.createElement('canvas');
+      if (plateCanvas.width !== hw) plateCanvas.width = hw;
+      if (plateCanvas.height !== hh) plateCanvas.height = hh;
       const pctx = plateCanvas.getContext('2d', { willReadFrequently: true })!;
+      pctx.clearRect(0, 0, hw, hh);
 
       if (dialVisible) {
-        drawDialPlate(pctx, pCfg);
+        drawDialPlate(pctx, hCfg);
       } else {
         pctx.fillStyle = '#090b0f';
-        pctx.fillRect(0, 0, pw, ph);
+        pctx.fillRect(0, 0, hw, hh);
       }
 
       cachedDialPlateRef.current = plateCanvas;
@@ -148,86 +199,116 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
 
     return () => window.cancelAnimationFrame(rafId);
   }, [
-    previewConfig.resolution,
-    previewConfig.dial.intactArtworkUrl,
-    previewConfig.dial.material,
-    previewConfig.dial.baseColor,
-    previewConfig.dial.secondaryColor,
-    previewConfig.dial.lightAngleDeg,
-    previewConfig.dial.iridescenceIntensity,
-    previewConfig.dial.overlayTintColor,
-    previewConfig.dial.overlayTintOpacity,
-    previewConfig.dial.customImage,
+    highResConfig.resolution,
+    highResConfig.dial.intactArtworkUrl,
+    highResConfig.dial.material,
+    highResConfig.dial.baseColor,
+    highResConfig.dial.secondaryColor,
+    highResConfig.dial.lightAngleDeg,
+    highResConfig.dial.iridescenceIntensity,
+    highResConfig.dial.overlayTintColor,
+    highResConfig.dial.overlayTintOpacity,
+    highResConfig.dial.customImage,
     dialVisible,
     imageLoadRev,
   ]);
 
-  // 2. Composite bezel & dial motifs onto cached dial plate
+  // 2. Composite bezel & dial motifs onto 2048px cached dial plate + draw synchronous frame
   useEffect(() => {
     if (!cachedDialPlateRef.current) return;
-    const pCfg = previewConfigRef.current;
-    const { width: pw, height: ph } = pCfg.resolution;
-    const compositeCanvas = document.createElement('canvas');
-    compositeCanvas.width = pw;
-    compositeCanvas.height = ph;
+    const hCfg = highResConfigRef.current;
+    const { width: hw, height: hh } = hCfg.resolution;
+    const compositeCanvas =
+      cachedStaticDialRef.current ?? document.createElement('canvas');
+    if (compositeCanvas.width !== hw) compositeCanvas.width = hw;
+    if (compositeCanvas.height !== hh) compositeCanvas.height = hh;
     const cctx = compositeCanvas.getContext('2d', { willReadFrequently: true })!;
+    cctx.clearRect(0, 0, hw, hh);
 
     if (
-      cachedDialPlateRef.current.width === pw &&
-      cachedDialPlateRef.current.height === ph
+      cachedDialPlateRef.current.width === hw &&
+      cachedDialPlateRef.current.height === hh
     ) {
       cctx.drawImage(cachedDialPlateRef.current, 0, 0);
     }
 
-    const intactMode = isUsingIntactArtwork(pCfg);
+    const intactMode = isUsingIntactArtwork(hCfg);
     if (bezelVisible && !intactMode) {
-      drawBezelAndOuterRing(cctx, pCfg);
+      drawBezelAndOuterRing(cctx, hCfg);
     }
     if (dialVisible && !intactMode) {
-      drawDialMotifLayer(cctx, pCfg);
+      drawDialMotifLayer(cctx, hCfg);
     }
 
     cachedStaticDialRef.current = compositeCanvas;
+
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (ctx) {
+        if (!liveHighResCanvasRef.current) {
+          liveHighResCanvasRef.current = document.createElement('canvas');
+        }
+        const sysClock = getSystemClockState(new Date());
+        renderSupersampledWatchFrame(
+          ctx,
+          previewConfigRef.current,
+          {
+            ...simRef.current,
+            realTime: true,
+            timeSeconds: sysClock.timeSeconds,
+          },
+          compositeCanvas,
+          liveHighResCanvasRef.current,
+          glyphCacheRef.current
+        );
+      }
+    }
   }, [
     dialPlateRevision,
-    previewConfig.resolution,
-    previewConfig.dial.intactArtworkUrl,
-    previewConfig.dial.customImage?.enabled,
-    previewConfig.bezel,
-    previewConfig.dial.motif,
-    previewConfig.displayMode,
-    previewConfig.hands.enabled,
+    highResConfig.resolution,
+    highResConfig.dial.intactArtworkUrl,
+    highResConfig.dial.customImage?.enabled,
+    highResConfig.bezel,
+    highResConfig.dial.motif,
+    highResConfig.dial.lightAngleDeg,
+    highResConfig.dial.recessedAoDepth,
+    highResConfig.displayMode,
+    highResConfig.hands.enabled,
     bezelVisible,
     dialVisible,
   ]);
 
-  // 3. Clear bitmap numeral glyph cache instantly on any digital color/style change
+  // 3. Clear bitmap numeral glyph cache instantly on any digital color/style/font change
   useEffect(() => {
     glyphCacheRef.current.clear();
   }, [
-    previewConfig.resolution,
-    previewConfig.digital.fontStyle,
-    previewConfig.digital.primaryColor,
-    previewConfig.digital.glowColor,
-    previewConfig.digital.hoursColorMode,
-    previewConfig.digital.hoursColor,
-    previewConfig.digital.hoursGradientTop,
-    previewConfig.digital.hoursGradientBottom,
-    previewConfig.digital.minutesColor,
-    previewConfig.digital.secondsColor,
-    previewConfig.digital.ampmColor,
-    previewConfig.digital.dateColor,
-    previewConfig.digital.metricsValueColor,
-    previewConfig.digital.metricsIconColor,
+    highResConfig.resolution,
+    highResConfig.digital.fontStyle,
+    highResConfig.digital.activeCustomFontId,
+    highResConfig.digital.customFonts,
+    highResConfig.digital.primaryColor,
+    highResConfig.digital.glowColor,
+    highResConfig.digital.hoursColorMode,
+    highResConfig.digital.hoursColor,
+    highResConfig.digital.hoursGradientTop,
+    highResConfig.digital.hoursGradientBottom,
+    highResConfig.digital.minutesColor,
+    highResConfig.digital.secondsColor,
+    highResConfig.digital.ampmColor,
+    highResConfig.digital.dateColor,
+    highResConfig.digital.metricsValueColor,
+    highResConfig.digital.metricsIconColor,
+    fontLoadRev,
   ]);
 
-  // Locked device-clock requestAnimationFrame render loop (with optional paused test time support)
+  // Locked device-clock requestAnimationFrame render loop at 2048px supersampling
   useEffect(() => {
     let rafId = 0;
     let cancelled = false;
     let lastDrawMs = 0;
+    let lastRenderCostMs = 0;
     let lastSecDrawn = -1;
-    let lastSimTimeDrawn = -1;
 
     const renderLoop = (nowMs: number) => {
       if (cancelled) return;
@@ -237,34 +318,41 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
       const canvas = canvasRef.current;
 
       const sysClock = getSystemClockState(new Date());
-      const effectiveTimeSec = currentSim.realTime
-        ? sysClock.timeSeconds
-        : currentSim.timeSeconds;
+      const sweepIntervalMs = Math.max(50, Math.min(350, lastRenderCostMs * 3));
       const shouldDraw =
         lastDrawMs === 0 ||
-        (!currentSim.realTime && effectiveTimeSec !== lastSimTimeDrawn) ||
-        (currentSim.realTime &&
-          (currentSim.sweep60fps
-            ? nowMs - lastDrawMs >= 66
-            : sysClock.seconds !== lastSecDrawn));
+        (currentSim.sweep60fps
+          ? nowMs - lastDrawMs >= sweepIntervalMs
+          : sysClock.seconds !== lastSecDrawn);
 
       if (shouldDraw && staticBg && canvas) {
+        const t0 = performance.now();
         lastDrawMs = nowMs;
         lastSecDrawn = sysClock.seconds;
-        lastSimTimeDrawn = effectiveTimeSec;
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (ctx) {
-          renderLiveWatchFrame(
+          if (!liveHighResCanvasRef.current) {
+            liveHighResCanvasRef.current = document.createElement('canvas');
+          }
+          renderSupersampledWatchFrame(
             ctx,
             currentConfig,
-            { ...currentSim, timeSeconds: effectiveTimeSec },
+            {
+              ...currentSim,
+              realTime: true,
+              timeSeconds: sysClock.timeSeconds,
+            },
             staticBg,
+            liveHighResCanvasRef.current,
             glyphCacheRef.current
           );
         }
+        lastRenderCostMs = performance.now() - t0;
       }
 
-      rafId = window.requestAnimationFrame(renderLoop);
+      if (!cancelled && !pauseRender) {
+        rafId = window.requestAnimationFrame(renderLoop);
+      }
     };
 
     rafId = window.requestAnimationFrame(renderLoop);
@@ -272,7 +360,7 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
       cancelled = true;
       window.cancelAnimationFrame(rafId);
     };
-  }, [dialPlateRevision, previewConfig, sim]);
+  }, [dialPlateRevision, previewConfig, sim, pauseRender, fontLoadRev]);
 
   const { width, height, shape } = config.resolution;
   const { width: previewW, height: previewH } = previewConfig.resolution;
@@ -314,6 +402,50 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
     }
   };
 
+  const primaryTimeWidget = getPrimaryTimeWidget(config);
+  const isDigitalLayerActive =
+    (config.layers.find((l) => l.id === 'digital')?.visible ?? true) &&
+    Boolean(primaryTimeWidget?.enabled);
+
+  const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isDigitalLayerActive || !primaryTimeWidget || !canvasRef.current) return;
+    canvasRef.current.setPointerCapture?.(e.pointerId);
+    dragClockRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origRelX: primaryTimeWidget.relX,
+      origRelY: primaryTimeWidget.relY,
+    };
+    setIsDraggingClock(true);
+  };
+
+  const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = dragClockRef.current;
+    if (!drag || !canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const { dRelX, dRelY } = clientDeltaToWatchRelDelta(
+      e.clientX - drag.startX,
+      e.clientY - drag.startY,
+      rect.width,
+      rect.height
+    );
+    onChangeConfig(
+      updatePrimaryTimeWidget(configRef.current, {
+        relX: drag.origRelX + dRelX,
+        relY: drag.origRelY + dRelY,
+      })
+    );
+  };
+
+  const handleCanvasPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (dragClockRef.current?.pointerId === e.pointerId) {
+      canvasRef.current?.releasePointerCapture?.(e.pointerId);
+      dragClockRef.current = null;
+      setIsDraggingClock(false);
+    }
+  };
+
   const activeCollectionList =
     quickCollection === 'round-analog'
       ? ROUND_WATCH_PRESETS.filter((p) => p.category === 'round-analog')
@@ -345,11 +477,14 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
           </div>
 
           <div className="flex items-center gap-3">
-            <label className="inline-flex items-center gap-1.5 cursor-pointer text-pink-300 font-medium">
+            <label className={`inline-flex items-center gap-1.5 text-pink-300 font-medium ${hardwareLock ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}>
               <input
                 type="checkbox"
+                disabled={Boolean(hardwareLock)}
                 checked={isFullHd}
-                onChange={(e) => handleToggleFullHdMaster(e.target.checked)}
+                onChange={(e) => {
+                  if (!hardwareLock) handleToggleFullHdMaster(e.target.checked);
+                }}
                 className="accent-pink-500"
               />
               <Sparkles className="w-3.5 h-3.5 text-pink-400" />
@@ -524,7 +659,22 @@ export const WatchViewport: React.FC<WatchViewportProps> = ({
                 data-testid="watch-simulator-canvas"
                 width={previewW}
                 height={previewH}
-                className="block max-w-[320px] max-h-[350px] w-auto h-auto select-none"
+                onPointerDown={handleCanvasPointerDown}
+                onPointerMove={handleCanvasPointerMove}
+                onPointerUp={handleCanvasPointerUp}
+                onPointerCancel={handleCanvasPointerUp}
+                title={
+                  isDigitalLayerActive
+                    ? 'Drag anywhere on watch to move digital clock position'
+                    : undefined
+                }
+                className={`block max-w-[320px] max-h-[350px] w-auto h-auto select-none ${
+                  isDigitalLayerActive
+                    ? isDraggingClock
+                      ? 'cursor-grabbing touch-none'
+                      : 'cursor-grab touch-none'
+                    : ''
+                }`}
               />
               {isDragOver && (
                 <div className="absolute inset-0 bg-slate-950/75 flex items-center justify-center text-xs font-semibold text-orange-300 pointer-events-none">

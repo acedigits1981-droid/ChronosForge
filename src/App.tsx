@@ -15,6 +15,7 @@ import { LanguageCode, SUPPORTED_LANGUAGES } from './i18n/translations';
 import {
   adaptWatchFaceToResolution,
   applyDisplayMode,
+  clampWatchExportResolution,
   cloneConfig,
   getDisplayMode,
   RESOLUTION_SPECS,
@@ -28,6 +29,13 @@ import {
   WatchDisplayMode,
   WatchFaceConfig,
 } from './types/watchface';
+import {
+  createHardwareLockedResolutionSpec,
+  HardwareResolutionLock,
+  isNativeConnectedState,
+  NativeWatchStateDetail,
+} from './types/nativeBridge';
+import { ensureConfigFontsRegistered } from './utils/customFontManager';
 import { loadCustomImageAndPalette } from './utils/paletteExtractor';
 
 function triggerDownload(
@@ -89,15 +97,62 @@ export default function App() {
   const [ladiesModalOpen, setLadiesModalOpen] = useState(false);
   const [clonerOpen, setClonerOpen] = useState(false);
   const [webBleOpen, setWebBleOpen] = useState(false);
+  const [hardwareLock, setHardwareLock] = useState<HardwareResolutionLock | null>(null);
+
+  // Global listener so hardware resolution lock stays synchronized inside & outside the modal
+  useEffect(() => {
+    const onNativeWatchState = (ev: Event) => {
+      const detail = (ev as CustomEvent<NativeWatchStateDetail>).detail;
+      if (!detail || !detail.lcdWidth || !detail.lcdHeight) return;
+      if (isNativeConnectedState(detail.state)) {
+        const lockedSpec = createHardwareLockedResolutionSpec(
+          detail.lcdWidth,
+          detail.lcdHeight,
+          Boolean(detail.isRound)
+        );
+        setHardwareLock((prev) => ({
+          mac: detail.mac || prev?.mac || '',
+          watchName: prev?.watchName || detail.mac || 'Connected Watch',
+          lcdWidth: lockedSpec.width,
+          lcdHeight: lockedSpec.height,
+          isRound: Boolean(detail.isRound),
+          shape: lockedSpec.shape,
+          dialType: detail.dialType ?? 0,
+          state: detail.state,
+        }));
+        setSim((prev) =>
+          prev.fullHdMasterMode ? { ...prev, fullHdMasterMode: false } : prev
+        );
+        setConfig((prev) => adaptWatchFaceToResolution(prev, lockedSpec));
+      } else if ((detail.state ?? '').toUpperCase().includes('DISCONNECT')) {
+        setHardwareLock(null);
+      }
+    };
+
+    window.addEventListener('native-watch-state', onNativeWatchState);
+    return () => {
+      window.removeEventListener('native-watch-state', onNativeWatchState);
+    };
+  }, []);
 
   // Debounced sprite atlas & memory budget compilation when inspecting Pro Studio
   useEffect(() => {
+    setCompiledAssets(null);
     if (uiMode !== 'pro') return;
+    let cancelled = false;
     const timer = window.setTimeout(() => {
-      const compiled = compileWatchSprites(config, sim);
-      setCompiledAssets(compiled);
+      ensureConfigFontsRegistered(config)
+        .catch(() => false)
+        .finally(() => {
+          if (cancelled) return;
+          const compiled = compileWatchSprites(config, sim);
+          setCompiledAssets(compiled);
+        });
     }, 120);
-    return () => window.clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [
     uiMode,
     config,
@@ -110,22 +165,36 @@ export default function App() {
 
   const handleSelectPreset = (preset: WatchFaceConfig) => {
     setConfig((prev) => {
-      const isCurrentlyFhd =
-        prev.resolution.isFullHdMaster ||
-        Math.max(prev.resolution.width, prev.resolution.height) >= 1000;
-      const targetRes =
-        prev.resolution.shape === preset.resolution.shape
-          ? prev.resolution
-          : isCurrentlyFhd
-          ? preset.resolution
-          : preset.resolution.shape === 'round'
-          ? RESOLUTION_SPECS[2]
-          : RESOLUTION_SPECS[6];
-      return adaptWatchFaceToResolution(preset, targetRes);
+      const targetRes = hardwareLock
+        ? createHardwareLockedResolutionSpec(
+            hardwareLock.lcdWidth,
+            hardwareLock.lcdHeight,
+            hardwareLock.isRound
+          )
+        : (() => {
+            const isCurrentlyFhd =
+              prev.resolution.isFullHdMaster ||
+              Math.max(prev.resolution.width, prev.resolution.height) >= 1000;
+            return prev.resolution.shape === preset.resolution.shape
+              ? prev.resolution
+              : isCurrentlyFhd
+              ? preset.resolution
+              : preset.resolution.shape === 'round'
+              ? RESOLUTION_SPECS[2]
+              : RESOLUTION_SPECS[6];
+          })();
+
+      const adapted = adaptWatchFaceToResolution(preset, targetRes);
+      if (prev.digital.customFonts && prev.digital.customFonts.length > 0) {
+        adapted.digital.customFonts = prev.digital.customFonts;
+        adapted.digital.activeCustomFontId = prev.digital.activeCustomFontId ?? null;
+      }
+      return adapted;
     });
   };
 
   const handleSelectResolution = (res: ResolutionSpec) => {
+    if (hardwareLock) return;
     setConfig((prev) => adaptWatchFaceToResolution(prev, res));
   };
 
@@ -163,16 +232,30 @@ export default function App() {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .replace(/^_|_$/g, '');
-      const assetsForExport =
-        compiledAssets ?? compileWatchSprites(config, sim);
+      const exportSpec = clampWatchExportResolution(
+        config.resolution,
+        hardwareLock
+      );
+      const exportConfig =
+        config.resolution.width === exportSpec.width &&
+        config.resolution.height === exportSpec.height &&
+        config.resolution.shape === exportSpec.shape
+          ? config
+          : adaptWatchFaceToResolution(config, exportSpec);
+      const reusableAssets =
+        compiledAssets &&
+        compiledAssets.width === exportSpec.width &&
+        compiledAssets.height === exportSpec.height
+          ? compiledAssets
+          : undefined;
       const pkg = await buildVeryFitPackage(
-        config,
+        exportConfig,
         sim,
         'lz4',
-        assetsForExport
+        reusableAssets
       );
       if (compressedLz) {
-        const fname = `${slug}_${config.resolution.id}.iwf.lz`;
+        const fname = `${slug}_${exportSpec.id}.iwf.lz`;
         triggerDownload(pkg.iwfLzBytes, fname);
         setLastExportBanner(
           `Exported VeryFit LZ4 package: ${fname} (${(
@@ -180,7 +263,7 @@ export default function App() {
           ).toFixed(1)} KB)`
         );
       } else {
-        const fname = `${slug}_${config.resolution.id}.iwf`;
+        const fname = `${slug}_${exportSpec.id}.iwf`;
         triggerDownload(pkg.iwfBytes, fname);
         setLastExportBanner(
           `Exported VeryFit IWF archive: ${fname} (${(
@@ -200,14 +283,28 @@ export default function App() {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .replace(/^_|_$/g, '');
-      const assetsForExport =
-        compiledAssets ?? compileWatchSprites(config, sim);
-      const binBytes = buildFitCloudBin(
-        config,
-        sim,
-        assetsForExport
+      const exportSpec = clampWatchExportResolution(
+        config.resolution,
+        hardwareLock
       );
-      const fname = `${slug}_${config.resolution.id}_tbui.bin`;
+      const exportConfig =
+        config.resolution.width === exportSpec.width &&
+        config.resolution.height === exportSpec.height &&
+        config.resolution.shape === exportSpec.shape
+          ? config
+          : adaptWatchFaceToResolution(config, exportSpec);
+      const reusableAssets =
+        compiledAssets &&
+        compiledAssets.width === exportSpec.width &&
+        compiledAssets.height === exportSpec.height
+          ? compiledAssets
+          : undefined;
+      const binBytes = buildFitCloudBin(
+        exportConfig,
+        sim,
+        reusableAssets
+      );
+      const fname = `${slug}_${exportSpec.id}_tbui.bin`;
       triggerDownload(binBytes, fname);
       setLastExportBanner(
         `Exported FitCloudPro TBUI binary: ${fname} (${(
@@ -225,6 +322,8 @@ export default function App() {
       ? config.dial.customImage.extractedPalette
       : artworkPalette;
   const activeDisplayMode = getDisplayMode(config);
+
+  const anyModalOpen = webBleOpen || ladiesModalOpen || clonerOpen;
 
   return (
     <PhotoPaletteContext.Provider value={extractedPhotoPalette}>
@@ -246,6 +345,8 @@ export default function App() {
           isExporting={isExporting}
           lastExportBanner={lastExportBanner}
           onDismissBanner={() => setLastExportBanner(null)}
+          pauseRender={anyModalOpen}
+          hardwareLock={hardwareLock}
         />
       ) : (
         <div className="min-h-screen lg:h-screen flex flex-col bg-[#090b0f] text-slate-100 overflow-x-hidden">
@@ -262,6 +363,7 @@ export default function App() {
             onExportFitCloud={handleExportFitCloud}
             onSwitchToEasy={() => setUiMode('easy')}
             isExporting={isExporting}
+            hardwareLock={hardwareLock}
           />
 
           {lastExportBanner && (
@@ -293,6 +395,8 @@ export default function App() {
               onSelectPreset={handleSelectPreset}
               onSelectResolution={handleSelectResolution}
               onOpenLadiesCollection={() => setLadiesModalOpen(true)}
+              pauseRender={anyModalOpen}
+              hardwareLock={hardwareLock}
             />
 
             <CompilerSidebar assets={compiledAssets} />
@@ -305,9 +409,19 @@ export default function App() {
         onClose={() => setLadiesModalOpen(false)}
         currentConfig={config}
         onApplyEnhancedDial={(nextCfg) => {
-          setConfig(nextCfg);
+          const finalCfg = hardwareLock
+            ? adaptWatchFaceToResolution(
+                nextCfg,
+                createHardwareLockedResolutionSpec(
+                  hardwareLock.lcdWidth,
+                  hardwareLock.lcdHeight,
+                  hardwareLock.isRound
+                )
+              )
+            : nextCfg;
+          setConfig(finalCfg);
           setLastExportBanner(
-            `Activated ${nextCfg.name} at ${nextCfg.resolution.width}×${nextCfg.resolution.height}px`
+            `Activated ${finalCfg.name} at ${finalCfg.resolution.width}×${finalCfg.resolution.height}px`
           );
         }}
       />
@@ -332,6 +446,8 @@ export default function App() {
         onClose={() => setWebBleOpen(false)}
         config={config}
         sim={sim}
+        hardwareLock={hardwareLock}
+        onHardwareLockChange={setHardwareLock}
       />
     </PhotoPaletteContext.Provider>
   );

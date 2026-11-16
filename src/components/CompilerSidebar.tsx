@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Cpu, Grid, HardDrive } from 'lucide-react';
-import { CompiledWatchAssets, CroppedSprite } from '../types/watchface';
+import { CompiledWatchAssets } from '../types/watchface';
 
 interface CompilerSidebarProps {
   assets: CompiledWatchAssets | null;
@@ -12,9 +12,7 @@ function formatKb(bytes: number): string {
 
 export const CompilerSidebar: React.FC<CompilerSidebarProps> = ({ assets }) => {
   const [filter, setFilter] = useState<'all' | 'hand' | 'arc' | 'glyph'>('all');
-  const [selectedSprite, setSelectedSprite] = useState<CroppedSprite | null>(
-    null
-  );
+  const [selectedSpriteId, setSelectedSpriteId] = useState<string | null>(null);
 
   if (!assets) {
     return (
@@ -34,7 +32,10 @@ export const CompilerSidebar: React.FC<CompilerSidebarProps> = ({ assets }) => {
     filter === 'all' ? true : s.category === filter
   );
 
-  const activeSprite = selectedSprite ?? assets.handHour;
+  const activeSprite =
+    (selectedSpriteId
+      ? assets.allSprites.find((s) => s.id === selectedSpriteId)
+      : null) ?? assets.handHour;
 
   return (
     <aside className="w-full lg:w-84 shrink-0 border-l border-slate-800/80 bg-[#0c0f16] flex flex-col h-full overflow-y-auto">
@@ -153,6 +154,9 @@ export const CompilerSidebar: React.FC<CompilerSidebarProps> = ({ assets }) => {
             <Grid className="w-3.5 h-3.5 text-sky-400" />
             04. Quantized Sprite Atlas
           </h3>
+          <span className="text-[10px] font-mono text-slate-400">
+            {assets.glyphs.length} glyphs
+          </span>
         </div>
 
         {/* Segmented Filter Control */}
@@ -181,13 +185,13 @@ export const CompilerSidebar: React.FC<CompilerSidebarProps> = ({ assets }) => {
         </div>
 
         <div className="grid grid-cols-3 gap-2 overflow-y-auto pr-1">
-          {filteredSprites.slice(0, 36).map((sprite) => {
+          {filteredSprites.slice(0, filter === 'glyph' ? 96 : 42).map((sprite) => {
             const isSel = activeSprite?.id === sprite.id;
             return (
               <button
                 key={sprite.id}
                 type="button"
-                onClick={() => setSelectedSprite(sprite)}
+                onClick={() => setSelectedSpriteId(sprite.id)}
                 className={`p-1.5 rounded-lg border text-left transition-colors cursor-pointer flex flex-col items-center ${
                   isSel
                     ? 'bg-[#171f30] border-orange-500'
@@ -203,7 +207,10 @@ export const CompilerSidebar: React.FC<CompilerSidebarProps> = ({ assets }) => {
                   />
                 </div>
                 <span className="text-[10px] font-mono text-slate-300 truncate w-full text-center">
-                  {sprite.id.replace('font_metrics_', '').replace('font_small_', '')}
+                  {sprite.id
+                    .replace('font_time_', '')
+                    .replace('font_metrics_', '')
+                    .replace('font_small_', '')}
                 </span>
                 <span className="text-[9px] font-mono text-slate-400">
                   {sprite.width}×{sprite.height}

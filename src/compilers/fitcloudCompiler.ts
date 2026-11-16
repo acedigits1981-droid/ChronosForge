@@ -4,6 +4,10 @@ import {
   WatchFaceConfig,
 } from '../types/watchface';
 import { compileWatchSprites } from '../engine/renderer';
+import {
+  adaptWatchFaceToResolution,
+  clampWatchExportResolution,
+} from '../presets/watchPresets';
 import { crc32 } from './compression';
 
 export const TBUI_ELEMENT_TYPES: Record<number, string> = {
@@ -98,10 +102,19 @@ export function buildFitCloudBin(
   precompiled?: CompiledWatchAssets,
   modelMagic = 'TBUI_CF20'
 ): Uint8Array {
-  const assets = precompiled ?? compileWatchSprites(config, sim);
-  const { width, height } = config.resolution;
+  const targetSpec = clampWatchExportResolution(config.resolution);
+  const clampedConfig =
+    config.resolution.width === targetSpec.width &&
+    config.resolution.height === targetSpec.height &&
+    config.resolution.shape === targetSpec.shape
+      ? config
+      : adaptWatchFaceToResolution(config, targetSpec);
+  const assets = precompiled ?? compileWatchSprites(clampedConfig, sim);
+  const width = assets.width;
+  const height = assets.height;
   const minDim = Math.min(width, height);
-  const isPureDigital = config.displayMode === 'digital' || !config.hands.enabled;
+  const isPureDigital =
+    clampedConfig.displayMode === 'digital' || !clampedConfig.hands.enabled;
 
   const blocks: TbuiBlockSpec[] = [];
 
