@@ -37,9 +37,19 @@ jobs:
           if [ ! -f "./node_modules/.bin/cap" ]; then
             npm install --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
           fi
+          if [ -d "android" ] && [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ]; then
+            mkdir -p /tmp/android_backup
+            cp -r android/* /tmp/android_backup/ 2>/dev/null || true
+            rm -rf android
+          fi
           if [ ! -d "android" ]; then
-            ./node_modules/.bin/cap init "ChronosForge Studio" "com.chronosforge.studio" --web-dir=dist
+            if [ ! -f "capacitor.config.ts" ] && [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.js" ]; then
+              ./node_modules/.bin/cap init "ChronosForge Studio" "com.chronosforge.studio" --web-dir=dist
+            fi
             ./node_modules/.bin/cap add android
+            if [ -d "/tmp/android_backup" ]; then
+              cp -rn /tmp/android_backup/* android/ 2>/dev/null || true
+            fi
           fi
           ./node_modules/.bin/cap sync android
 
@@ -50,12 +60,19 @@ jobs:
           java-version: '21'
           cache: 'gradle'
 
-      - name: Grant Execute Permission to Gradle Wrapper
-        run: chmod +x android/gradlew
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
       - name: Compile Android Debug APK
         working-directory: android
-        run: ./gradlew assembleDebug --no-daemon
+        run: |
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 8.9
+          fi
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload Downloadable APK Artifact
         uses: actions/upload-artifact@v4
