@@ -68,6 +68,7 @@ jobs:
       - name: Compile Android Debug APK
         working-directory: android
         run: |
+          sed -i 's/isAllowInsecureProtocol/allowInsecureProtocol/g' settings.gradle build.gradle app/build.gradle 2>/dev/null || true
           if [ ! -f "./gradlew" ]; then
             gradle wrapper --gradle-version 8.9
           fi
