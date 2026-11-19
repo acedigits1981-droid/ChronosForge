@@ -53,12 +53,20 @@ jobs:
           rm -rf /tmp/fitcloud-sdk
           git clone --depth 1 https://github.com/htangsmart/FitCloudPro-SDK-Android.git /tmp/fitcloud-sdk
           mkdir -p android/app/libs
-          find /tmp/fitcloud-sdk -type f \( -name "*.aar" -o -name "*.jar" \) ! -name "gradle-wrapper.jar" -exec cp -f {} android/app/libs/ \;
-          if ! ls android/app/libs/*fitcloud*.aar >/dev/null 2>&1; then
-            if [ -d "/tmp/fitcloud-sdk/sdk/src/main/java" ]; then
-              cp -rf /tmp/fitcloud-sdk/sdk/src/main/java/* android/app/src/main/java/
-            fi
+
+          MAIN_AAR=$(find /tmp/fitcloud-sdk/libs -maxdepth 2 -type f -name "sdk-fitcloud-*.aar" ! -name "*compat*" | sort -V | tail -n 1)
+          if [ -z "$MAIN_AAR" ]; then
+            MAIN_AAR=$(find /tmp/fitcloud-sdk/libs -maxdepth 2 -type f -name "sdk-fitcloud-*.aar" | sort -V | tail -n 1)
           fi
+          if [ -n "$MAIN_AAR" ]; then
+            cp -f "$MAIN_AAR" android/app/libs/
+          fi
+
+          find /tmp/fitcloud-sdk/libs -maxdepth 2 -type f \( -name "*.aar" -o -name "*.jar" \) \
+            ! -name "sdk-fitcloud-*.aar" \
+            ! -name "libraryCore_rxjava3*.aar" \
+            -exec cp -f {} android/app/libs/ \; 2>/dev/null || true
+
           ls -la android/app/libs/
 
       - name: Write FitCloudPro NativeWatchBridge & Permissions
@@ -420,11 +428,13 @@ jobs:
             let appGradle = fs.readFileSync("android/app/build.gradle", "utf8");
             const sdkDeps = `
               implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
+              implementation "com.google.android.material:material:1.12.0"
               implementation "io.reactivex.rxjava3:rxandroid:3.0.2"
               implementation "io.reactivex.rxjava3:rxjava:3.1.8"
               implementation "com.jakewharton.rxrelay3:rxrelay:3.0.1"
               implementation "no.nordicsemi.android:ble:2.6.1"
               implementation "no.nordicsemi.android.support.v18:scanner:1.6.0"
+              implementation "no.nordicsemi.android:dfu:2.5.0"
           `;
             appGradle = appGradle.replace(/dependencies\s*\{/, "dependencies {" + sdkDeps);
             fs.writeFileSync("android/app/build.gradle", appGradle);
