@@ -48,24 +48,21 @@ jobs:
           fi
           ./node_modules/.bin/cap add android
 
-      - name: Fetch Official FitCloudPro Android SDK from GitHub
+      - name: Fetch Core FitCloudPro Android SDK from GitHub
         run: |
           rm -rf /tmp/fitcloud-sdk
           git clone --depth 1 https://github.com/htangsmart/FitCloudPro-SDK-Android.git /tmp/fitcloud-sdk
           mkdir -p android/app/libs
 
-          MAIN_AAR=$(find /tmp/fitcloud-sdk/libs -maxdepth 2 -type f -name "sdk-fitcloud-*.aar" ! -name "*compat*" | sort -V | tail -n 1)
-          if [ -z "$MAIN_AAR" ]; then
-            MAIN_AAR=$(find /tmp/fitcloud-sdk/libs -maxdepth 2 -type f -name "sdk-fitcloud-*.aar" | sort -V | tail -n 1)
+          COMPAT_AAR=$(find /tmp/fitcloud-sdk -type f -name "sdk-fitcloud-compat-*.aar" | sort -V | tail -n 1)
+          if [ -n "$COMPAT_AAR" ]; then
+            cp -f "$COMPAT_AAR" android/app/libs/
+          else
+            MAIN_AAR=$(find /tmp/fitcloud-sdk -type f -name "sdk-fitcloud-*.aar" | sort -V | tail -n 1)
+            [ -n "$MAIN_AAR" ] && cp -f "$MAIN_AAR" android/app/libs/
+            BASE_AAR=$(find /tmp/fitcloud-sdk -type f -name "sdk-base-*.aar" | sort -V | tail -n 1)
+            [ -n "$BASE_AAR" ] && cp -f "$BASE_AAR" android/app/libs/
           fi
-          if [ -n "$MAIN_AAR" ]; then
-            cp -f "$MAIN_AAR" android/app/libs/
-          fi
-
-          find /tmp/fitcloud-sdk/libs -maxdepth 2 -type f \( -name "*.aar" -o -name "*.jar" \) \
-            ! -name "sdk-fitcloud-*.aar" \
-            ! -name "libraryCore_rxjava3*.aar" \
-            -exec cp -f {} android/app/libs/ \; 2>/dev/null || true
 
           ls -la android/app/libs/
 
@@ -429,6 +426,7 @@ jobs:
             const sdkDeps = `
               implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
               implementation "com.google.android.material:material:1.12.0"
+              implementation "com.google.code.gson:gson:2.10.1"
               implementation "io.reactivex.rxjava3:rxandroid:3.0.2"
               implementation "io.reactivex.rxjava3:rxjava:3.1.8"
               implementation "com.jakewharton.rxrelay3:rxrelay:3.0.1"
