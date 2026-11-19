@@ -45,263 +45,356 @@ jobs:
           fi
           ./node_modules/.bin/cap add android
 
-      - name: Write NativeWatchBridge.kt & MainActivity.kt
+      - name: Write Native Android Bluetooth Bridge & Permissions
         run: |
           PKG_DIR="android/app/src/main/java/com/chronosforge/studio"
           mkdir -p "$PKG_DIR"
-          rm -f "$PKG_DIR/MainActivity.java"
 
-          cat << 'EOF' > "$PKG_DIR/NativeWatchBridge.kt"
-          package com.chronosforge.studio
+          cat << 'EOF' > "$PKG_DIR/NativeWatchBridge.java"
+          package com.chronosforge.studio;
 
-          import android.annotation.SuppressLint
-          import android.bluetooth.*
-          import android.bluetooth.le.ScanCallback
-          import android.bluetooth.le.ScanResult
-          import android.content.Context
-          import android.os.Handler
-          import android.os.Looper
-          import android.util.Base64
-          import android.webkit.JavascriptInterface
-          import android.webkit.WebView
-          import com.topstep.fitcloud.sdk.v2.FcSDK
-          import com.topstep.fitcloud.sdk.v2.dfu.FcDfuManager
-          import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers
-          import io.reactivex.rxjava3.disposables.CompositeDisposable
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.io.File
-          import java.io.FileOutputStream
+          import android.annotation.SuppressLint;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothGatt;
+          import android.bluetooth.BluetoothGattCallback;
+          import android.bluetooth.BluetoothGattCharacteristic;
+          import android.bluetooth.BluetoothGattDescriptor;
+          import android.bluetooth.BluetoothGattService;
+          import android.bluetooth.BluetoothManager;
+          import android.bluetooth.BluetoothProfile;
+          import android.bluetooth.le.BluetoothLeScanner;
+          import android.bluetooth.le.ScanCallback;
+          import android.bluetooth.le.ScanResult;
+          import android.bluetooth.le.ScanSettings;
+          import android.content.Context;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.util.Arrays;
+          import java.util.UUID;
 
           @SuppressLint("MissingPermission")
-          class NativeWatchBridge(
-              private val context: Context,
-              private val webView: WebView
-          ) {
-              private val mainHandler = Handler(Looper.getMainLooper())
-              private val disposables = CompositeDisposable()
-              private val fcSDK: FcSDK = FcSDK.Builder(context.applicationContext).build()
-              private var rawGatt: BluetoothGatt? = null
+          public class NativeWatchBridge {
+              private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+              private static final UUID VERYFIT_SERVICE = UUID.fromString("00000af0-0000-1000-8000-00805f9b34fb");
+              private static final UUID VERYFIT_WRITE = UUID.fromString("00000af6-0000-1000-8000-00805f9b34fb");
 
-              private fun emitToWeb(eventName: String, payloadJson: String) {
-                  mainHandler.post {
-                      val escaped = payloadJson.replace("\\", "\\\\").replace("'", "\\'")
+              private final Context context;
+              private final WebView webView;
+              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private BluetoothGatt activeGatt;
+              private BluetoothGattCharacteristic activeWriteChar;
+              private String connectedMac;
+              private int negotiatedMtu = 23;
+              private volatile boolean cancelRequested = false;
+
+              public NativeWatchBridge(Context context, WebView webView) {
+                  this.context = context.getApplicationContext();
+                  this.webView = webView;
+              }
+
+              private void emitToWeb(String eventName, String payloadJson) {
+                  mainHandler.post(() -> {
+                      String escaped = payloadJson.replace("\\", "\\\\").replace("'", "\\'");
                       webView.evaluateJavascript(
-                          "window.dispatchEvent(new CustomEvent('$eventName', { detail: JSON.parse('$escaped') }));",
+                          "window.dispatchEvent(new CustomEvent('" + eventName + "', { detail: JSON.parse('" + escaped + "') }));",
                           null
-                      )
-                  }
+                      );
+                  });
               }
 
               @JavascriptInterface
-              fun scanWatches() {
-                  val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                  val scanner = manager.adapter?.bluetoothLeScanner
-                  if (scanner == null) {
-                      emitToWeb("native-watch-error", JSONObject().put("message", "Turn on Bluetooth and try scanning again.").toString())
-                      return
-                  }
-                  val callback = object : ScanCallback() {
-                      override fun onScanResult(callbackType: Int, result: ScanResult) {
-                          val deviceName = result.device.name ?: result.scanRecord?.deviceName ?: return
-                          val obj = JSONObject().apply {
-                              put("name", deviceName)
-                              put("mac", result.device.address)
-                              put("rssi", result.rssi)
-                          }
-                          emitToWeb("native-watch-found", obj.toString())
-                      }
-                  }
-                  scanner.startScan(callback)
-                  mainHandler.postDelayed({
-                      try { scanner.stopScan(callback) } catch (_: Exception) {}
-                  }, 15_000L)
-              }
-
-              @JavascriptInterface
-              fun connectFitCloudWatch(macAddress: String) {
-                  val prefs = context.getSharedPreferences("chronos_watch_prefs", Context.MODE_PRIVATE)
-                  val localUserId = prefs.getString("user_id", null) ?: run {
-                      val generated = "watch_user_" + (100000..999999).random()
-                      prefs.edit().putString("user_id", generated).apply()
-                      generated
-                  }
-
-                  fcSDK.connector.connect(
-                      macAddress,
-                      localUserId,
-                      true,
-                      true,
-                      30,
-                      175f,
-                      75f
-                  )
-
-                  val stateSub = fcSDK.connector.observerConnectorState()
-                      .observeOn(AndroidSchedulers.mainThread())
-                      .subscribe({ state ->
-                          val info = fcSDK.deviceInfoAbility.getDeviceInfo()
-                          val res = JSONObject().apply {
-                              put("state", state.name)
-                              put("mac", macAddress)
-                              put("lcdWidth", info?.lcdWidth ?: 466)
-                              put("lcdHeight", info?.lcdHeight ?: 466)
-                              put("isRound", info?.isRound ?: true)
-                              put("dialType", info?.dialType ?: 0)
-                          }
-                          emitToWeb("native-watch-state", res.toString())
-                      }, { err ->
-                          emitToWeb("native-watch-error", JSONObject().put("message", err.message ?: "Connection error").toString())
-                      })
-                  disposables.add(stateSub)
-              }
-
-              @JavascriptInterface
-              fun inspectRawGatt(macAddress: String) {
-                  val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                  val device = manager.adapter.getRemoteDevice(macAddress)
-                  rawGatt?.close()
-                  rawGatt = device.connectGatt(context, false, object : BluetoothGattCallback() {
-                      override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                          if (newState == BluetoothProfile.STATE_CONNECTED) {
-                              gatt.discoverServices()
-                          }
-                      }
-
-                      override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                          val servicesArray = JSONArray()
-                          for (service in gatt.services) {
-                              val charsArray = JSONArray()
-                              for (ch in service.characteristics) {
-                                  val props = ch.properties
-                                  charsArray.put(JSONObject().apply {
-                                      put("uuid", ch.uuid.toString())
-                                      put("read", (props and BluetoothGattCharacteristic.PROPERTY_READ) != 0)
-                                      put("write", (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0)
-                                      put("writeNoResp", (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0)
-                                      put("notify", (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0)
-                                  })
-                              }
-                              servicesArray.put(JSONObject().apply {
-                                  put("serviceUuid", service.uuid.toString())
-                                  put("characteristics", charsArray)
-                              })
-                          }
-                          emitToWeb("native-raw-gatt", servicesArray.toString())
-                      }
-                  }, BluetoothDevice.TRANSPORT_LE)
-              }
-
-              @JavascriptInterface
-              fun pushFitCloudBin(base64Data: String) {
+              public void scanWatches() {
                   try {
-                      val cleanBase64 = base64Data.substringAfter(",")
-                      val binBytes = Base64.decode(cleanBase64, Base64.DEFAULT)
-                      val dialFile = File(context.cacheDir, "chronos_custom_dial.bin")
-                      FileOutputStream(dialFile).use { it.write(binBytes) }
+                      BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+                      BluetoothAdapter adapter = manager != null ? manager.getAdapter() : null;
+                      BluetoothLeScanner scanner = adapter != null ? adapter.getBluetoothLeScanner() : null;
 
-                      val dfuManager = fcSDK.newDfuManager()
-                      val dfuSub = dfuManager.start(FcDfuManager.DfuType.DIAL, dialFile, 0.toByte())
-                          .observeOn(AndroidSchedulers.mainThread())
-                          .subscribe({ progress ->
-                              val status = JSONObject().apply {
-                                  put("state", progress.state.name)
-                                  put("percent", progress.progress)
-                                  put("bytesSent", (binBytes.size * progress.progress) / 100)
-                                  put("totalBytes", binBytes.size)
+                      if (scanner == null) {
+                          emitToWeb("native-watch-error", "{\"message\":\"Please turn on Bluetooth and Location, then try again.\"}");
+                          return;
+                      }
+
+                      ScanCallback callback = new ScanCallback() {
+                          @Override
+                          public void onScanResult(int callbackType, ScanResult result) {
+                              BluetoothDevice dev = result.getDevice();
+                              String name = dev.getName();
+                              if (name == null && result.getScanRecord() != null) {
+                                  name = result.getScanRecord().getDeviceName();
                               }
-                              emitToWeb("native-dfu-progress", status.toString())
-                          }, { err ->
-                              emitToWeb("native-watch-error", JSONObject().put("message", "DFU Failed: ${err.message}").toString())
-                          }, {
-                              emitToWeb("native-dfu-complete", JSONObject().put("installed", true).toString())
-                          })
-                      disposables.add(dfuSub)
-                  } catch (e: Exception) {
-                      emitToWeb("native-watch-error", JSONObject().put("message", e.message ?: "Push failed").toString())
+                              if (name == null || name.isEmpty()) return;
+
+                              try {
+                                  JSONObject obj = new JSONObject();
+                                  obj.put("name", name);
+                                  obj.put("mac", dev.getAddress());
+                                  obj.put("rssi", result.getRssi());
+                                  emitToWeb("native-watch-found", obj.toString());
+                              } catch (Exception ignored) {}
+                          }
+                      };
+
+                      ScanSettings settings = new ScanSettings.Builder()
+                          .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                          .build();
+
+                      scanner.startScan(null, settings, callback);
+                      mainHandler.postDelayed(() -> {
+                          try { scanner.stopScan(callback); } catch (Exception ignored) {}
+                      }, 15000L);
+                  } catch (Exception e) {
+                      emitToWeb("native-watch-error", "{\"message\":\"Scan failed: " + e.getMessage() + "\"}");
                   }
+              }
+
+              @JavascriptInterface
+              public void connectFitCloudWatch(String macAddress) {
+                  connectAndInspect(macAddress);
+              }
+
+              @JavascriptInterface
+              public void inspectRawGatt(String macAddress) {
+                  if (activeGatt != null && macAddress.equals(connectedMac) && !activeGatt.getServices().isEmpty()) {
+                      emitGattServices(activeGatt);
+                      return;
+                  }
+                  connectAndInspect(macAddress);
+              }
+
+              private void connectAndInspect(String macAddress) {
+                  try {
+                      connectedMac = macAddress;
+                      BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+                      BluetoothDevice device = manager.getAdapter().getRemoteDevice(macAddress);
+
+                      if (device.getBondState() == BluetoothDevice.BOND_NONE) {
+                          try { device.createBond(); } catch (Exception ignored) {}
+                      }
+
+                      if (activeGatt != null) {
+                          try { activeGatt.close(); } catch (Exception ignored) {}
+                      }
+                      activeWriteChar = null;
+                      negotiatedMtu = 23;
+
+                      activeGatt = device.connectGatt(context, false, new BluetoothGattCallback() {
+                          @Override
+                          public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+                              if (newState == BluetoothProfile.STATE_CONNECTED) {
+                                  try {
+                                      gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+                                      gatt.requestMtu(247);
+                                  } catch (Exception e) {
+                                      gatt.discoverServices();
+                                  }
+                              } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                                  emitToWeb("native-watch-error", "{\"message\":\"Watch disconnected. Keep watch awake and close stock app.\"}");
+                              }
+                          }
+
+                          @Override
+                          public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+                              if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
+                                  negotiatedMtu = mtu;
+                              }
+                              gatt.discoverServices();
+                          }
+
+                          @Override
+                          public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+                              emitGattServices(gatt);
+                              try {
+                                  JSONObject state = new JSONObject();
+                                  state.put("state", "CONNECTED");
+                                  state.put("mac", macAddress);
+                                  state.put("lcdWidth", 466);
+                                  state.put("lcdHeight", 466);
+                                  state.put("isRound", true);
+                                  state.put("dialType", 1);
+                                  emitToWeb("native-watch-state", state.toString());
+                              } catch (Exception ignored) {}
+                          }
+                      }, BluetoothDevice.TRANSPORT_LE);
+                  } catch (Exception e) {
+                      emitToWeb("native-watch-error", "{\"message\":\"Connect error: " + e.getMessage() + "\"}");
+                  }
+              }
+
+              private void emitGattServices(BluetoothGatt gatt) {
+                  try {
+                      JSONArray servicesArray = new JSONArray();
+                      BluetoothGattCharacteristic fallbackWrite = null;
+
+                      for (BluetoothGattService service : gatt.getServices()) {
+                          String svcUuid = service.getUuid().toString().toLowerCase();
+                          boolean isGeneric = svcUuid.startsWith("00001800") || svcUuid.startsWith("00001801") || svcUuid.startsWith("0000180a");
+                          JSONArray charsArray = new JSONArray();
+
+                          for (BluetoothGattCharacteristic ch : service.getCharacteristics()) {
+                              int props = ch.getProperties();
+                              boolean canRead = (props & BluetoothGattCharacteristic.PROPERTY_READ) != 0;
+                              boolean canWrite = (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+                              boolean canWriteNoResp = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
+                              boolean canNotify = (props & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0;
+
+                              if (canNotify) {
+                                  try {
+                                      gatt.setCharacteristicNotification(ch, true);
+                                      BluetoothGattDescriptor desc = ch.getDescriptor(CCCD_UUID);
+                                      if (desc != null) {
+                                          if (Build.VERSION.SDK_INT >= 33) {
+                                              gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                                          } else {
+                                              desc.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                                              gatt.writeDescriptor(desc);
+                                          }
+                                      }
+                                  } catch (Exception ignored) {}
+                              }
+
+                              if (VERYFIT_SERVICE.equals(service.getUuid()) && VERYFIT_WRITE.equals(ch.getUuid())) {
+                                  activeWriteChar = ch;
+                              } else if (!isGeneric && (canWrite || canWriteNoResp) && fallbackWrite == null) {
+                                  fallbackWrite = ch;
+                              }
+
+                              JSONObject chObj = new JSONObject();
+                              chObj.put("uuid", ch.getUuid().toString());
+                              chObj.put("read", canRead);
+                              chObj.put("write", canWrite);
+                              chObj.put("writeNoResp", canWriteNoResp);
+                              chObj.put("notify", canNotify);
+                              charsArray.put(chObj);
+                          }
+
+                          JSONObject svcObj = new JSONObject();
+                          svcObj.put("serviceUuid", service.getUuid().toString());
+                          svcObj.put("characteristics", charsArray);
+                          servicesArray.put(svcObj);
+                      }
+
+                      if (activeWriteChar == null) {
+                          activeWriteChar = fallbackWrite;
+                      }
+                      emitToWeb("native-raw-gatt", servicesArray.toString());
+                  } catch (Exception ignored) {}
+              }
+
+              @JavascriptInterface
+              public void pushFitCloudBin(String base64Data) {
+                  streamBinaryPayload(base64Data);
+              }
+
+              @JavascriptInterface
+              public void pushVeryFitIwf(String base64Data, String macAddress) {
+                  streamBinaryPayload(base64Data);
+              }
+
+              private void streamBinaryPayload(String base64Data) {
+                  if (activeGatt == null || activeWriteChar == null) {
+                      emitToWeb("native-watch-error", "{\"message\":\"No writable watch channel bound. Inspect Raw GATT below or use Quick Apply.\"}");
+                      return;
+                  }
+
+                  cancelRequested = false;
+                  new Thread(() -> {
+                      try {
+                          String clean = base64Data.contains(",") ? base64Data.substring(base64Data.indexOf(",") + 1) : base64Data;
+                          byte[] payload = Base64.decode(clean, Base64.DEFAULT);
+                          int chunkSize = Math.max(20, Math.min(240, negotiatedMtu - 3));
+                          int props = activeWriteChar.getProperties();
+                          int writeType = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                              ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                              : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+
+                          int offset = 0;
+                          while (offset < payload.length && !cancelRequested) {
+                              int end = Math.min(offset + chunkSize, payload.length);
+                              byte[] slice = Arrays.copyOfRange(payload, offset, end);
+
+                              if (Build.VERSION.SDK_INT >= 33) {
+                                  activeGatt.writeCharacteristic(activeWriteChar, slice, writeType);
+                              } else {
+                                  activeWriteChar.setWriteType(writeType);
+                                  activeWriteChar.setValue(slice);
+                                  activeGatt.writeCharacteristic(activeWriteChar);
+                              }
+
+                              offset = end;
+                              int pct = (int) ((offset * 100L) / payload.length);
+                              JSONObject prog = new JSONObject();
+                              prog.put("state", "STREAMING");
+                              prog.put("percent", pct);
+                              prog.put("bytesSent", offset);
+                              prog.put("totalBytes", payload.length);
+                              emitToWeb("native-dfu-progress", prog.toString());
+                              Thread.sleep(16);
+                          }
+
+                          if (!cancelRequested) {
+                              emitToWeb("native-dfu-complete", "{\"installed\":true}");
+                          }
+                      } catch (Exception e) {
+                          emitToWeb("native-watch-error", "{\"message\":\"Transfer error: " + e.getMessage() + "\"}");
+                      }
+                  }).start();
               }
           }
           EOF
 
-          cat << 'EOF' > "$PKG_DIR/MainActivity.kt"
-          package com.chronosforge.studio
+          cat << 'EOF' > "$PKG_DIR/MainActivity.java"
+          package com.chronosforge.studio;
 
-          import android.Manifest
-          import android.os.Build
-          import android.os.Bundle
-          import androidx.core.app.ActivityCompat
-          import com.getcapacitor.BridgeActivity
+          import android.Manifest;
+          import android.os.Build;
+          import android.os.Bundle;
+          import androidx.core.app.ActivityCompat;
+          import com.getcapacitor.BridgeActivity;
 
-          class MainActivity : BridgeActivity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
 
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                       ActivityCompat.requestPermissions(
                           this,
-                          arrayOf(
+                          new String[]{
                               Manifest.permission.BLUETOOTH_SCAN,
                               Manifest.permission.BLUETOOTH_CONNECT,
                               Manifest.permission.ACCESS_FINE_LOCATION
-                          ),
+                          },
                           1001
-                      )
+                      );
                   } else {
                       ActivityCompat.requestPermissions(
                           this,
-                          arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+                          new String[]{
+                              Manifest.permission.ACCESS_FINE_LOCATION
+                          },
                           1001
-                      )
+                      );
                   }
 
-                  bridge.webView.addJavascriptInterface(
-                      NativeWatchBridge(this, bridge.webView),
-                      "NativeWatchBridge"
-                  )
+                  if (getBridge() != null && getBridge().getWebView() != null) {
+                      getBridge().getWebView().addJavascriptInterface(
+                          new NativeWatchBridge(this, getBridge().getWebView()),
+                          "NativeWatchBridge"
+                      );
+                  }
               }
           }
           EOF
 
-          ./node_modules/.bin/cap sync android
-
-      - name: Configure Gradle, Kotlin, TopStep SDK & Bluetooth Permissions
-        run: |
           node -e '
             const fs = require("fs");
-
-            let rootGradle = fs.readFileSync("android/build.gradle", "utf8");
-            if (!rootGradle.includes("kotlin-gradle-plugin")) {
-              rootGradle = rootGradle.replace(
-                /dependencies\s*\{/,
-                "dependencies {\n        classpath \"org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24\""
-              );
-            }
-            if (!rootGradle.includes("maven.topstep.com.cn")) {
-              rootGradle = rootGradle.replace(
-                /allprojects\s*\{\s*repositories\s*\{/,
-                "allprojects {\n    repositories {\n        maven { url \"https://jitpack.io\" }\n        maven { url \"http://maven.topstep.com.cn/repository/maven-public/\"; allowInsecureProtocol = true }"
-              );
-            }
-            fs.writeFileSync("android/build.gradle", rootGradle);
-
-            let appGradle = fs.readFileSync("android/app/build.gradle", "utf8");
-            appGradle = appGradle.replace(
-              /apply plugin:\s*[\x27"]com\.android\.application[\x27"]/,
-              "apply plugin: \"com.android.application\"\napply plugin: \"kotlin-android\""
-            );
-            appGradle += `\nandroid {\n    compileOptions {\n        sourceCompatibility JavaVersion.VERSION_17\n        targetCompatibility JavaVersion.VERSION_17\n    }\n    kotlinOptions {\n        jvmTarget = "17"\n    }\n}\n`;
-            const sdkDeps = `
-              implementation("com.topstep.wearkit:sdk-fitcloud:3.0.1") {
-                  exclude group: "com.topstep.wearkit", module: "ext-realtek-bbpro"
-                  exclude group: "com.topstep.wearkit", module: "ext-realtek-file"
-              }
-              implementation "io.reactivex.rxjava3:rxandroid:3.0.2"
-              implementation "io.reactivex.rxjava3:rxjava:3.1.8"
-          `;
-            appGradle = appGradle.replace(/dependencies\s*\{/, "dependencies {" + sdkDeps);
-            fs.writeFileSync("android/app/build.gradle", appGradle);
-
             const manifestPath = "android/app/src/main/AndroidManifest.xml";
             let manifest = fs.readFileSync(manifestPath, "utf8");
             const perms = `
@@ -314,6 +407,8 @@ jobs:
             manifest = manifest.replace("<application", perms + "\n    <application");
             fs.writeFileSync(manifestPath, manifest);
           '
+
+          ./node_modules/.bin/cap sync android
 
       - name: Set Up JDK 21
         uses: actions/setup-java@v4
