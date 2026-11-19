@@ -48,7 +48,20 @@ jobs:
           fi
           ./node_modules/.bin/cap add android
 
-      - name: Write Native Android Bluetooth Bridge & Permissions
+      - name: Fetch Official FitCloudPro Android SDK from GitHub
+        run: |
+          rm -rf /tmp/fitcloud-sdk
+          git clone --depth 1 https://github.com/htangsmart/FitCloudPro-SDK-Android.git /tmp/fitcloud-sdk
+          mkdir -p android/app/libs
+          find /tmp/fitcloud-sdk -type f \( -name "*.aar" -o -name "*.jar" \) ! -name "gradle-wrapper.jar" -exec cp -f {} android/app/libs/ \;
+          if ! ls android/app/libs/*fitcloud*.aar >/dev/null 2>&1; then
+            if [ -d "/tmp/fitcloud-sdk/sdk/src/main/java" ]; then
+              cp -rf /tmp/fitcloud-sdk/sdk/src/main/java/* android/app/src/main/java/
+            fi
+          fi
+          ls -la android/app/libs/
+
+      - name: Write FitCloudPro NativeWatchBridge & Permissions
         run: |
           PKG_DIR="android/app/src/main/java/com/chronosforge/studio"
           mkdir -p "$PKG_DIR"
@@ -62,7 +75,6 @@ jobs:
           import android.bluetooth.BluetoothGatt;
           import android.bluetooth.BluetoothGattCallback;
           import android.bluetooth.BluetoothGattCharacteristic;
-          import android.bluetooth.BluetoothGattDescriptor;
           import android.bluetooth.BluetoothGattService;
           import android.bluetooth.BluetoothManager;
           import android.bluetooth.BluetoothProfile;
@@ -71,35 +83,47 @@ jobs:
           import android.bluetooth.le.ScanResult;
           import android.bluetooth.le.ScanSettings;
           import android.content.Context;
-          import android.os.Build;
+          import android.content.SharedPreferences;
           import android.os.Handler;
           import android.os.Looper;
           import android.util.Base64;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebView;
+          import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
+          import io.reactivex.rxjava3.core.Observable;
+          import io.reactivex.rxjava3.disposables.CompositeDisposable;
+          import io.reactivex.rxjava3.disposables.Disposable;
           import org.json.JSONArray;
           import org.json.JSONObject;
-          import java.util.Arrays;
-          import java.util.UUID;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.lang.reflect.Method;
+          import java.util.Random;
 
           @SuppressLint("MissingPermission")
           public class NativeWatchBridge {
-              private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-              private static final UUID VERYFIT_SERVICE = UUID.fromString("00000af0-0000-1000-8000-00805f9b34fb");
-              private static final UUID VERYFIT_WRITE = UUID.fromString("00000af6-0000-1000-8000-00805f9b34fb");
-
               private final Context context;
               private final WebView webView;
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
-              private BluetoothGatt activeGatt;
-              private BluetoothGattCharacteristic activeWriteChar;
+              private final CompositeDisposable disposables = new CompositeDisposable();
+              private Object fcSdk;
+              private BluetoothGatt rawGatt;
               private String connectedMac;
-              private int negotiatedMtu = 23;
-              private volatile boolean cancelRequested = false;
 
               public NativeWatchBridge(Context context, WebView webView) {
                   this.context = context.getApplicationContext();
                   this.webView = webView;
+                  initFitCloudSdk();
+              }
+
+              private void initFitCloudSdk() {
+                  try {
+                      Class<?> builderClass = Class.forName("com.topstep.fitcloud.sdk.v2.FcSDK$Builder");
+                      Object builder = builderClass.getConstructor(Context.class).newInstance(context);
+                      fcSdk = builderClass.getMethod("build").invoke(builder);
+                  } catch (Throwable t) {
+                      fcSdk = null;
+                  }
               }
 
               private void emitToWeb(String eventName, String payloadJson) {
@@ -120,7 +144,7 @@ jobs:
                       BluetoothLeScanner scanner = adapter != null ? adapter.getBluetoothLeScanner() : null;
 
                       if (scanner == null) {
-                          emitToWeb("native-watch-error", "{\"message\":\"Please turn on Bluetooth and Location, then try again.\"}");
+                          emitToWeb("native-watch-error", "{\"message\":\"Please turn on Bluetooth and Location, then scan again.\"}");
                           return;
                       }
 
@@ -159,195 +183,189 @@ jobs:
 
               @JavascriptInterface
               public void connectFitCloudWatch(String macAddress) {
-                  connectAndInspect(macAddress);
+                  connectedMac = macAddress;
+                  if (fcSdk == null) {
+                      initFitCloudSdk();
+                  }
+                  if (fcSdk == null) {
+                      emitToWeb("native-watch-error", "{\"message\":\"FitCloudPro SDK failed to initialize on this device.\"}");
+                      return;
+                  }
+
+                  try {
+                      SharedPreferences prefs = context.getSharedPreferences("chronos_watch_prefs", Context.MODE_PRIVATE);
+                      String localUserId = prefs.getString("user_id", null);
+                      if (localUserId == null) {
+                          localUserId = "watch_user_" + (100000 + new Random().nextInt(900000));
+                          prefs.edit().putString("user_id", localUserId).apply();
+                      }
+
+                      Object connector = fcSdk.getClass().getMethod("getConnector").invoke(fcSdk);
+                      Method connectMethod = connector.getClass().getMethod(
+                          "connect", String.class, String.class, boolean.class, boolean.class, int.class, float.class, float.class
+                      );
+                      connectMethod.invoke(connector, macAddress, localUserId, true, true, 30, 175f, 75f);
+
+                      @SuppressWarnings("unchecked")
+                      Observable<Object> stateObs = (Observable<Object>) connector.getClass()
+                          .getMethod("observerConnectorState")
+                          .invoke(connector);
+
+                      Disposable sub = stateObs
+                          .observeOn(AndroidSchedulers.mainThread())
+                          .subscribe(stateObj -> {
+                              String stateName = String.valueOf(stateObj);
+                              int lcdWidth = 466;
+                              int lcdHeight = 466;
+                              boolean isRound = true;
+                              int dialType = 1;
+
+                              if (stateName.contains("CONNECTED")) {
+                                  try {
+                                      Object infoAbility = fcSdk.getClass().getMethod("getDeviceInfoAbility").invoke(fcSdk);
+                                      Object devInfo = infoAbility.getClass().getMethod("getDeviceInfo").invoke(infoAbility);
+                                      if (devInfo != null) {
+                                          lcdWidth = (int) devInfo.getClass().getMethod("getLcdWidth").invoke(devInfo);
+                                          lcdHeight = (int) devInfo.getClass().getMethod("getLcdHeight").invoke(devInfo);
+                                          isRound = (boolean) devInfo.getClass().getMethod("isRound").invoke(devInfo);
+                                          dialType = (int) devInfo.getClass().getMethod("getDialType").invoke(devInfo);
+                                      }
+                                  } catch (Throwable ignored) {}
+                              }
+
+                              JSONObject res = new JSONObject();
+                              res.put("state", stateName);
+                              res.put("mac", macAddress);
+                              res.put("lcdWidth", lcdWidth > 0 ? lcdWidth : 466);
+                              res.put("lcdHeight", lcdHeight > 0 ? lcdHeight : 466);
+                              res.put("isRound", isRound);
+                              res.put("dialType", dialType);
+                              emitToWeb("native-watch-state", res.toString());
+                          }, err -> {
+                              emitToWeb("native-watch-error", "{\"message\":\"FitCloud connect error: " + err.getMessage() + "\"}");
+                          });
+                      disposables.add(sub);
+                  } catch (Throwable t) {
+                      emitToWeb("native-watch-error", "{\"message\":\"FitCloud bridge error: " + t.getMessage() + "\"}");
+                  }
               }
 
               @JavascriptInterface
               public void inspectRawGatt(String macAddress) {
-                  if (activeGatt != null && macAddress.equals(connectedMac) && !activeGatt.getServices().isEmpty()) {
-                      emitGattServices(activeGatt);
-                      return;
-                  }
-                  connectAndInspect(macAddress);
-              }
-
-              private void connectAndInspect(String macAddress) {
                   try {
-                      connectedMac = macAddress;
                       BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
                       BluetoothDevice device = manager.getAdapter().getRemoteDevice(macAddress);
-
-                      if (device.getBondState() == BluetoothDevice.BOND_NONE) {
-                          try { device.createBond(); } catch (Exception ignored) {}
+                      if (rawGatt != null) {
+                          try { rawGatt.close(); } catch (Exception ignored) {}
                       }
-
-                      if (activeGatt != null) {
-                          try { activeGatt.close(); } catch (Exception ignored) {}
-                      }
-                      activeWriteChar = null;
-                      negotiatedMtu = 23;
-
-                      activeGatt = device.connectGatt(context, false, new BluetoothGattCallback() {
+                      rawGatt = device.connectGatt(context, false, new BluetoothGattCallback() {
                           @Override
                           public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
                               if (newState == BluetoothProfile.STATE_CONNECTED) {
-                                  try {
-                                      gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-                                      gatt.requestMtu(247);
-                                  } catch (Exception e) {
-                                      gatt.discoverServices();
-                                  }
-                              } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                                  emitToWeb("native-watch-error", "{\"message\":\"Watch disconnected. Keep watch awake and close stock app.\"}");
+                                  gatt.discoverServices();
                               }
-                          }
-
-                          @Override
-                          public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-                              if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
-                                  negotiatedMtu = mtu;
-                              }
-                              gatt.discoverServices();
                           }
 
                           @Override
                           public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-                              emitGattServices(gatt);
                               try {
-                                  JSONObject state = new JSONObject();
-                                  state.put("state", "CONNECTED");
-                                  state.put("mac", macAddress);
-                                  state.put("lcdWidth", 466);
-                                  state.put("lcdHeight", 466);
-                                  state.put("isRound", true);
-                                  state.put("dialType", 1);
-                                  emitToWeb("native-watch-state", state.toString());
+                                  JSONArray servicesArray = new JSONArray();
+                                  for (BluetoothGattService service : gatt.getServices()) {
+                                      JSONArray charsArray = new JSONArray();
+                                      for (BluetoothGattCharacteristic ch : service.getCharacteristics()) {
+                                          int props = ch.getProperties();
+                                          JSONObject chObj = new JSONObject();
+                                          chObj.put("uuid", ch.getUuid().toString());
+                                          chObj.put("read", (props & BluetoothGattCharacteristic.PROPERTY_READ) != 0);
+                                          chObj.put("write", (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0);
+                                          chObj.put("writeNoResp", (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0);
+                                          chObj.put("notify", (props & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0);
+                                          charsArray.put(chObj);
+                                      }
+                                      JSONObject svcObj = new JSONObject();
+                                      svcObj.put("serviceUuid", service.getUuid().toString());
+                                      svcObj.put("characteristics", charsArray);
+                                      servicesArray.put(svcObj);
+                                  }
+                                  emitToWeb("native-raw-gatt", servicesArray.toString());
                               } catch (Exception ignored) {}
                           }
                       }, BluetoothDevice.TRANSPORT_LE);
                   } catch (Exception e) {
-                      emitToWeb("native-watch-error", "{\"message\":\"Connect error: " + e.getMessage() + "\"}");
+                      emitToWeb("native-watch-error", "{\"message\":\"GATT inspect error: " + e.getMessage() + "\"}");
                   }
-              }
-
-              private void emitGattServices(BluetoothGatt gatt) {
-                  try {
-                      JSONArray servicesArray = new JSONArray();
-                      BluetoothGattCharacteristic fallbackWrite = null;
-
-                      for (BluetoothGattService service : gatt.getServices()) {
-                          String svcUuid = service.getUuid().toString().toLowerCase();
-                          boolean isGeneric = svcUuid.startsWith("00001800") || svcUuid.startsWith("00001801") || svcUuid.startsWith("0000180a");
-                          JSONArray charsArray = new JSONArray();
-
-                          for (BluetoothGattCharacteristic ch : service.getCharacteristics()) {
-                              int props = ch.getProperties();
-                              boolean canRead = (props & BluetoothGattCharacteristic.PROPERTY_READ) != 0;
-                              boolean canWrite = (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
-                              boolean canWriteNoResp = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
-                              boolean canNotify = (props & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0;
-
-                              if (canNotify) {
-                                  try {
-                                      gatt.setCharacteristicNotification(ch, true);
-                                      BluetoothGattDescriptor desc = ch.getDescriptor(CCCD_UUID);
-                                      if (desc != null) {
-                                          if (Build.VERSION.SDK_INT >= 33) {
-                                              gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                                          } else {
-                                              desc.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                                              gatt.writeDescriptor(desc);
-                                          }
-                                      }
-                                  } catch (Exception ignored) {}
-                              }
-
-                              if (VERYFIT_SERVICE.equals(service.getUuid()) && VERYFIT_WRITE.equals(ch.getUuid())) {
-                                  activeWriteChar = ch;
-                              } else if (!isGeneric && (canWrite || canWriteNoResp) && fallbackWrite == null) {
-                                  fallbackWrite = ch;
-                              }
-
-                              JSONObject chObj = new JSONObject();
-                              chObj.put("uuid", ch.getUuid().toString());
-                              chObj.put("read", canRead);
-                              chObj.put("write", canWrite);
-                              chObj.put("writeNoResp", canWriteNoResp);
-                              chObj.put("notify", canNotify);
-                              charsArray.put(chObj);
-                          }
-
-                          JSONObject svcObj = new JSONObject();
-                          svcObj.put("serviceUuid", service.getUuid().toString());
-                          svcObj.put("characteristics", charsArray);
-                          servicesArray.put(svcObj);
-                      }
-
-                      if (activeWriteChar == null) {
-                          activeWriteChar = fallbackWrite;
-                      }
-                      emitToWeb("native-raw-gatt", servicesArray.toString());
-                  } catch (Exception ignored) {}
               }
 
               @JavascriptInterface
               public void pushFitCloudBin(String base64Data) {
-                  streamBinaryPayload(base64Data);
+                  if (fcSdk == null) {
+                      emitToWeb("native-watch-error", "{\"message\":\"FitCloudPro SDK not ready. Tap Scan and connect to S71 first.\"}");
+                      return;
+                  }
+
+                  try {
+                      String cleanBase64 = base64Data.contains(",") ? base64Data.substring(base64Data.indexOf(",") + 1) : base64Data;
+                      byte[] binBytes = Base64.decode(cleanBase64, Base64.DEFAULT);
+                      File dialFile = new File(context.getCacheDir(), "chronos_custom_dial.bin");
+                      try (FileOutputStream fos = new FileOutputStream(dialFile)) {
+                          fos.write(binBytes);
+                      }
+
+                      Object dfuManager = fcSdk.getClass().getMethod("newDfuManager").invoke(fcSdk);
+                      Class<?> dfuTypeClass = Class.forName("com.topstep.fitcloud.sdk.v2.dfu.FcDfuManager$DfuType");
+                      @SuppressWarnings({"unchecked", "rawtypes"})
+                      Object dialEnum = Enum.valueOf((Class<Enum>) dfuTypeClass, "DIAL");
+
+                      Method startMethod = null;
+                      for (Method m : dfuManager.getClass().getMethods()) {
+                          if ("start".equals(m.getName()) && m.getParameterTypes().length == 3) {
+                              startMethod = m;
+                              break;
+                          }
+                      }
+
+                      if (startMethod == null) {
+                          emitToWeb("native-watch-error", "{\"message\":\"FcDfuManager.start() method not found.\"}");
+                          return;
+                      }
+
+                      Class<?> thirdParam = startMethod.getParameterTypes()[2];
+                      Object binFlagArg = (thirdParam == int.class || thirdParam == Integer.class) ? Integer.valueOf(0) : Byte.valueOf((byte) 0);
+
+                      @SuppressWarnings("unchecked")
+                      Observable<Object> dfuObs = (Observable<Object>) startMethod.invoke(dfuManager, dialEnum, dialFile, binFlagArg);
+
+                      Disposable dfuSub = dfuObs
+                          .observeOn(AndroidSchedulers.mainThread())
+                          .subscribe(progressObj -> {
+                              int pct = 0;
+                              String stateStr = "DFU_TRANSFERRING";
+                              try {
+                                  pct = (int) progressObj.getClass().getMethod("getProgress").invoke(progressObj);
+                                  Object st = progressObj.getClass().getMethod("getState").invoke(progressObj);
+                                  if (st != null) stateStr = String.valueOf(st);
+                              } catch (Throwable ignored) {}
+
+                              JSONObject status = new JSONObject();
+                              status.put("state", stateStr);
+                              status.put("percent", pct);
+                              status.put("bytesSent", (binBytes.length * pct) / 100);
+                              status.put("totalBytes", binBytes.length);
+                              emitToWeb("native-dfu-progress", status.toString());
+                          }, err -> {
+                              emitToWeb("native-watch-error", "{\"message\":\"S71 DFU Failed: " + err.getMessage() + "\"}");
+                          }, () -> {
+                              emitToWeb("native-dfu-complete", "{\"installed\":true}");
+                          });
+                      disposables.add(dfuSub);
+                  } catch (Throwable t) {
+                      emitToWeb("native-watch-error", "{\"message\":\"Push failed: " + t.getMessage() + "\"}");
+                  }
               }
 
               @JavascriptInterface
               public void pushVeryFitIwf(String base64Data, String macAddress) {
-                  streamBinaryPayload(base64Data);
-              }
-
-              private void streamBinaryPayload(String base64Data) {
-                  if (activeGatt == null || activeWriteChar == null) {
-                      emitToWeb("native-watch-error", "{\"message\":\"No writable watch channel bound. Inspect Raw GATT below or use Quick Apply.\"}");
-                      return;
-                  }
-
-                  cancelRequested = false;
-                  new Thread(() -> {
-                      try {
-                          String clean = base64Data.contains(",") ? base64Data.substring(base64Data.indexOf(",") + 1) : base64Data;
-                          byte[] payload = Base64.decode(clean, Base64.DEFAULT);
-                          int chunkSize = Math.max(20, Math.min(240, negotiatedMtu - 3));
-                          int props = activeWriteChar.getProperties();
-                          int writeType = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
-                              ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                              : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
-
-                          int offset = 0;
-                          while (offset < payload.length && !cancelRequested) {
-                              int end = Math.min(offset + chunkSize, payload.length);
-                              byte[] slice = Arrays.copyOfRange(payload, offset, end);
-
-                              if (Build.VERSION.SDK_INT >= 33) {
-                                  activeGatt.writeCharacteristic(activeWriteChar, slice, writeType);
-                              } else {
-                                  activeWriteChar.setWriteType(writeType);
-                                  activeWriteChar.setValue(slice);
-                                  activeGatt.writeCharacteristic(activeWriteChar);
-                              }
-
-                              offset = end;
-                              int pct = (int) ((offset * 100L) / payload.length);
-                              JSONObject prog = new JSONObject();
-                              prog.put("state", "STREAMING");
-                              prog.put("percent", pct);
-                              prog.put("bytesSent", offset);
-                              prog.put("totalBytes", payload.length);
-                              emitToWeb("native-dfu-progress", prog.toString());
-                              Thread.sleep(16);
-                          }
-
-                          if (!cancelRequested) {
-                              emitToWeb("native-dfu-complete", "{\"installed\":true}");
-                          }
-                      } catch (Exception e) {
-                          emitToWeb("native-watch-error", "{\"message\":\"Transfer error: " + e.getMessage() + "\"}");
-                      }
-                  }).start();
+                  emitToWeb("native-watch-error", "{\"message\":\"Direct VeryFit BLE DFU is disabled; use Quick Apply for VeryFit watches.\"}");
               }
           }
           EOF
@@ -398,6 +416,19 @@ jobs:
 
           node -e '
             const fs = require("fs");
+
+            let appGradle = fs.readFileSync("android/app/build.gradle", "utf8");
+            const sdkDeps = `
+              implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
+              implementation "io.reactivex.rxjava3:rxandroid:3.0.2"
+              implementation "io.reactivex.rxjava3:rxjava:3.1.8"
+              implementation "com.jakewharton.rxrelay3:rxrelay:3.0.1"
+              implementation "no.nordicsemi.android:ble:2.6.1"
+              implementation "no.nordicsemi.android.support.v18:scanner:1.6.0"
+          `;
+            appGradle = appGradle.replace(/dependencies\s*\{/, "dependencies {" + sdkDeps);
+            fs.writeFileSync("android/app/build.gradle", appGradle);
+
             const manifestPath = "android/app/src/main/AndroidManifest.xml";
             let manifest = fs.readFileSync(manifestPath, "utf8");
             const perms = `
@@ -406,6 +437,8 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
           `;
             manifest = manifest.replace("<application", perms + "\n    <application");
             fs.writeFileSync(manifestPath, manifest);
@@ -444,6 +477,6 @@ jobs:
           else
             gh release create "$TAG" ChronosForge-Studio.apk \
               --title "ChronosForge Studio $TAG" \
-              --notes "Direct Android APK download for ChronosForge Studio (Build #${{ github.run_number }})." \
+              --notes "Direct Android APK download with official FitCloudPro S71 DFU support (Build #${{ github.run_number }})." \
               --latest
           fi
